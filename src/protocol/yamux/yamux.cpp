@@ -1,5 +1,7 @@
 #include "yamux.hpp"
 
+#include <utility>
+
 // TODO: implement Yamux framing per spec:
 // https://github.com/hashicorp/yamux/blob/master/spec.md
 

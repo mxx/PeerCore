@@ -1,5 +1,7 @@
 #include "../include/peercore/controller.hpp"
 
+#include <utility>
+
 namespace peercore {
 
 void DefaultController::on_swarm_event(const SwarmEvent& /*event*/) {
