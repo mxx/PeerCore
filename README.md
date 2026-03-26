@@ -55,7 +55,9 @@ cmake --build build
 ## Test
 
 ```sh
-ctest --test-dir build --output-on-failure
+make -C build test
+# 或
+cmake --build build --target test
 ```
 
 Expected output:
@@ -111,6 +113,32 @@ PeerCore/
     ├── test_routing_table.cpp
     └── test_swarm.cpp
 ```
+
+## Coverage
+
+Requires `lcov` and `genhtml`:
+
+```sh
+brew install lcov        # macOS
+apt install lcov         # Ubuntu
+```
+
+Configure and build with coverage instrumentation:
+
+```sh
+cmake -B build-cov -DCMAKE_BUILD_TYPE=Debug -DPEERCORE_COVERAGE=ON
+cmake --build build-cov
+```
+
+Generate report:
+
+```sh
+make -C build-cov coverage
+# 或
+cmake --build build-cov --target coverage
+```
+
+HTML report: `build-cov/coverage/html/index.html`
 
 ## Implementation Status
 
