@@ -81,6 +81,7 @@ DebugSnapshot Swarm::snapshot() const {
     return DebugSnapshot{
         .connection_count = static_cast<uint32_t>(connections_.size()),
         .stream_count     = 0,  // TODO: sum streams across connections
+        .extra            = {},
     };
 }
 
