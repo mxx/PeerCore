@@ -21,5 +21,6 @@ add_subdirectory(src)
 # Tests
 if(PEERCORE_BUILD_TESTS)
   enable_testing()
+  list(APPEND CMAKE_CTEST_ARGUMENTS "--verbose")
   add_subdirectory(tests)
 endif()
