@@ -83,16 +83,17 @@ void EventLoop::cancel_timer(TimerId id) {
         timers_.end());
 }
 
-// ── poll_once ─────────────────────────────────────────────────────────────────
+// ── poll_once / run ───────────────────────────────────────────────────────────
 
-void EventLoop::poll_once() {
-    auto delay_ms = next_timer_delay().count();
-
+// Dispatch pending I/O events with the given timeout (milliseconds).
+// timeout=0 → non-blocking; timeout=-1 → block until next timer.
+void EventLoop::poll_with_timeout(long timeout_ms) {
 #if defined(PEERCORE_USE_KQUEUE)
     constexpr int kMaxEvents = 64;
     struct kevent events[kMaxEvents];
-    struct timespec ts{delay_ms / 1000, (delay_ms % 1000) * 1'000'000L};
-    int n = ::kevent(queue_fd_, nullptr, 0, events, kMaxEvents, &ts);
+    struct timespec ts{timeout_ms / 1000, (timeout_ms % 1000) * 1'000'000L};
+    int n = ::kevent(queue_fd_, nullptr, 0, events, kMaxEvents,
+                     timeout_ms < 0 ? nullptr : &ts);
     for (int i = 0; i < n; ++i) {
         Fd fd = static_cast<Fd>(events[i].ident);
         for (auto& h : fd_handlers_) {
@@ -107,7 +108,7 @@ void EventLoop::poll_once() {
 #else
     constexpr int kMaxEvents = 64;
     epoll_event events[kMaxEvents];
-    int n = ::epoll_wait(queue_fd_, events, kMaxEvents, static_cast<int>(delay_ms));
+    int n = ::epoll_wait(queue_fd_, events, kMaxEvents, static_cast<int>(timeout_ms));
     for (int i = 0; i < n; ++i) {
         Fd fd = events[i].data.fd;
         for (auto& h : fd_handlers_) {
@@ -124,9 +125,15 @@ void EventLoop::poll_once() {
     fire_timers();
 }
 
+void EventLoop::poll_once() {
+    poll_with_timeout(0);
+}
+
 void EventLoop::run() {
     running_ = true;
-    while (running_) poll_once();
+    while (running_) {
+        poll_with_timeout(next_timer_delay().count());
+    }
 }
 
 void EventLoop::stop() { running_ = false; }

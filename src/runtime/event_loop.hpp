@@ -43,14 +43,15 @@ public:
                       bool repeat = false);
     void cancel_timer(TimerId id);
 
-    // Run one iteration (non-blocking)
+    // Non-blocking: process ready FDs and due timers, then return immediately
     void poll_once();
 
-    // Blocking run until stop() is called
+    // Blocking run until stop() is called; sleeps between iterations
     void run();
     void stop();
 
 private:
+    void poll_with_timeout(long timeout_ms);
     int  queue_fd_{-1};   // kqueue fd (macOS) or epoll fd (Linux)
     bool running_{false};
 
