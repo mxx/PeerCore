@@ -1,8 +1,11 @@
 #include "event_loop.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <stdexcept>
 #include <unistd.h>
+
+#include "peercore/log.hpp"
 
 #if defined(__APPLE__) || defined(__FreeBSD__)
 #  include <sys/event.h>
@@ -15,19 +18,31 @@
 
 namespace peercore::runtime {
 
+namespace {
+constexpr std::string_view kComp = "peercore/runtime";
+} // namespace
+
 // ── Construction / destruction ────────────────────────────────────────────────
 
 EventLoop::EventLoop() {
 #if defined(PEERCORE_USE_KQUEUE)
     queue_fd_ = ::kqueue();
-    if (queue_fd_ < 0) throw std::runtime_error("kqueue() failed");
+    if (queue_fd_ < 0) {
+        PEERCORE_LOG_ERROR(kComp, "kqueue() failed: errno={}", errno);
+        throw std::runtime_error("kqueue() failed");
+    }
 #else
     queue_fd_ = ::epoll_create1(EPOLL_CLOEXEC);
-    if (queue_fd_ < 0) throw std::runtime_error("epoll_create1() failed");
+    if (queue_fd_ < 0) {
+        PEERCORE_LOG_ERROR(kComp, "epoll_create1() failed: errno={}", errno);
+        throw std::runtime_error("epoll_create1() failed");
+    }
 #endif
+    PEERCORE_LOG_DEBUG(kComp, "EventLoop created (fd={})", queue_fd_);
 }
 
 EventLoop::~EventLoop() {
+    PEERCORE_LOG_DEBUG(kComp, "EventLoop destroyed");
     if (queue_fd_ >= 0) ::close(queue_fd_);
 }
 
@@ -38,19 +53,25 @@ void EventLoop::register_fd(Fd fd, std::function<void(IoEvent)> callback) {
     struct kevent changes[2];
     EV_SET(&changes[0], fd, EVFILT_READ,  EV_ADD | EV_CLEAR, 0, 0, nullptr);
     EV_SET(&changes[1], fd, EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, nullptr);
-    if (::kevent(queue_fd_, changes, 2, nullptr, 0, nullptr) < 0)
+    if (::kevent(queue_fd_, changes, 2, nullptr, 0, nullptr) < 0) {
+        PEERCORE_LOG_ERROR(kComp, "kevent register failed: fd={} errno={}", fd, errno);
         throw std::runtime_error("kevent register failed");
+    }
 #else
     epoll_event ev{};
     ev.events  = EPOLLIN | EPOLLOUT | EPOLLET;
     ev.data.fd = fd;
-    if (::epoll_ctl(queue_fd_, EPOLL_CTL_ADD, fd, &ev) < 0)
+    if (::epoll_ctl(queue_fd_, EPOLL_CTL_ADD, fd, &ev) < 0) {
+        PEERCORE_LOG_ERROR(kComp, "epoll_ctl ADD failed: fd={} errno={}", fd, errno);
         throw std::runtime_error("epoll_ctl EPOLL_CTL_ADD failed");
+    }
 #endif
     fd_handlers_.push_back({fd, std::move(callback)});
+    PEERCORE_LOG_TRACE(kComp, "register_fd fd={}", fd);
 }
 
 void EventLoop::unregister_fd(Fd fd) {
+    PEERCORE_LOG_TRACE(kComp, "unregister_fd fd={}", fd);
 #if defined(PEERCORE_USE_KQUEUE)
     struct kevent changes[2];
     EV_SET(&changes[0], fd, EVFILT_READ,  EV_DELETE, 0, 0, nullptr);
@@ -73,10 +94,12 @@ TimerId EventLoop::add_timer(std::chrono::milliseconds delay,
     TimerId id = next_timer_id_++;
     timers_.push_back({id, std::chrono::steady_clock::now() + delay,
                        std::move(callback), repeat, delay});
+    PEERCORE_LOG_TRACE(kComp, "add_timer id={} delay={}ms repeat={}", id, delay.count(), repeat);
     return id;
 }
 
 void EventLoop::cancel_timer(TimerId id) {
+    PEERCORE_LOG_TRACE(kComp, "cancel_timer id={}", id);
     timers_.erase(
         std::remove_if(timers_.begin(), timers_.end(),
                        [id](const Timer& t) { return t.id == id; }),
@@ -131,12 +154,16 @@ void EventLoop::poll_once() {
 
 void EventLoop::run() {
     running_ = true;
+    PEERCORE_LOG_INFO(kComp, "event loop started");
     while (running_) {
         poll_with_timeout(next_timer_delay().count());
     }
 }
 
-void EventLoop::stop() { running_ = false; }
+void EventLoop::stop() {
+    PEERCORE_LOG_INFO(kComp, "event loop stopped");
+    running_ = false;
+}
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -144,6 +171,7 @@ void EventLoop::fire_timers() {
     auto now = std::chrono::steady_clock::now();
     for (auto& t : timers_) {
         if (now >= t.deadline) {
+            PEERCORE_LOG_TRACE(kComp, "fire_timer id={}", t.id);
             t.callback();
             if (t.repeat) t.deadline = now + t.interval;
         }

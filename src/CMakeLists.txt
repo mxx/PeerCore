@@ -1,4 +1,5 @@
 add_library(peercore
+    log.cpp
     types.cpp
     peer_store.cpp
     routing_table.cpp
@@ -34,3 +35,10 @@ target_link_libraries(peercore
 target_compile_options(peercore PRIVATE
   -Wall -Wextra -Wpedantic
 )
+
+# Optional: allow overriding compile-time log level via cmake -DPEERCORE_LOG_LEVEL=N
+if(DEFINED PEERCORE_LOG_LEVEL)
+    target_compile_definitions(peercore
+        PUBLIC PEERCORE_LOG_LEVEL=${PEERCORE_LOG_LEVEL}
+    )
+endif()
