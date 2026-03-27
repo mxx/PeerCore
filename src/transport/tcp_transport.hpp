@@ -3,6 +3,7 @@
 #include "../../include/peercore/types.hpp"
 
 #include <functional>
+#include <vector>
 
 namespace peercore::transport {
 
@@ -30,6 +31,12 @@ public:
 
     // Called by EventLoop when the listen socket is readable
     void on_accept_ready(RawFd listen_fd);
+    // Called by EventLoop when a non-blocking connect socket becomes writable
+    void on_connect_ready(RawFd socket_fd);
+
+    std::vector<RawFd> listener_fds() const;
+    std::vector<RawFd> dialing_fds() const;
+    Result<Multiaddr> local_addr(RawFd fd) const;
 
     void close_all();
 
@@ -40,10 +47,17 @@ private:
         TcpTransportCallbacks callbacks;
     };
 
-    std::vector<Listener> listeners_;
+    struct PendingDial {
+        RawFd fd{-1};
+        Multiaddr addr;
+        TcpTransportCallbacks callbacks;
+    };
 
-    static Result<RawFd>     create_listen_socket(const Multiaddr& addr);
-    static Result<TcpSocket> create_connected_socket(const Multiaddr& addr);
+    std::vector<Listener> listeners_;
+    std::vector<PendingDial> pending_dials_;
+
+    static Result<RawFd> create_listen_socket(const Multiaddr& addr);
+    static Result<RawFd> create_connect_socket(const Multiaddr& addr);
 };
 
 }  // namespace peercore::transport

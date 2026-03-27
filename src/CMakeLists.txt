@@ -6,6 +6,7 @@ add_library(peercore
     controller.cpp
     swarm.cpp
     node.cpp
+    connection_session.cpp
 
     runtime/event_loop.cpp
 

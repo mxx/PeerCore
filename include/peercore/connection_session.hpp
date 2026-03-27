@@ -4,6 +4,7 @@
 #include "muxed_stream.hpp"
 #include "types.hpp"
 
+#include <memory>
 #include <optional>
 
 namespace peercore {
@@ -46,5 +47,15 @@ public:
 
     virtual void close() = 0;
 };
+
+std::unique_ptr<ConnectionSession> make_outbound_connection_session(
+    ConnectionId id,
+    int socket_fd,
+    Multiaddr remote_addr);
+
+std::unique_ptr<ConnectionSession> make_inbound_connection_session(
+    ConnectionId id,
+    int socket_fd,
+    Multiaddr remote_addr);
 
 }  // namespace peercore
