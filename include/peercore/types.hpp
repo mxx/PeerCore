@@ -10,6 +10,9 @@
 
 namespace peercore {
 
+template <typename T>
+class Result;
+
 // ── Identity ──────────────────────────────────────────────────────────────────
 
 // 32-byte Ed25519 public key used as peer identity
@@ -30,10 +33,18 @@ struct Identity {
 
 // Minimal Multiaddr (stored as serialised bytes, decoded on demand)
 struct Multiaddr {
+    struct Ip4TcpEndpoint {
+        std::string ip;
+        uint16_t    port{0};
+    };
+
     std::vector<uint8_t> bytes;
 
     explicit Multiaddr(std::string_view text);
     std::string to_string() const;
+
+    Result<Ip4TcpEndpoint> parse_ip4_tcp() const;
+    static Multiaddr from_ip4_tcp(std::string_view ip, uint16_t port);
 };
 
 // ── Handles & IDs ─────────────────────────────────────────────────────────────

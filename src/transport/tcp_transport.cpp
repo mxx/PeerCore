@@ -20,51 +20,25 @@ namespace {
 
 constexpr std::string_view kComp = "peercore/tcp";
 
-struct SocketAddress {
-    sockaddr_in addr{};
-    socklen_t   len{sizeof(sockaddr_in)};
-};
-
-Result<SocketAddress> parse_ip4_tcp(const Multiaddr& multiaddr) {
-    const auto text = multiaddr.to_string();
-    std::array<std::string, 5> parts{};
-
-    size_t start = 0;
-    size_t index = 0;
-    while (start <= text.size() && index < parts.size()) {
-        const size_t slash = text.find('/', start);
-        const size_t end = slash == std::string::npos ? text.size() : slash;
-        if (end > start) {
-            parts[index++] = text.substr(start, end - start);
-        }
-        if (slash == std::string::npos) break;
-        start = slash + 1;
+Result<sockaddr_in> to_sockaddr(const Multiaddr& addr) {
+    auto endpoint = addr.parse_ip4_tcp();
+    if (endpoint.is_err()) {
+        return Result<sockaddr_in>::err(endpoint.error().message);
     }
 
-    if (index != 4 || parts[0] != "ip4" || parts[2] != "tcp") {
-        return Result<SocketAddress>::err("only /ip4/<addr>/tcp/<port> is supported");
+    sockaddr_in out{};
+    out.sin_family = AF_INET;
+    out.sin_port = htons(endpoint.value().port);
+    if (::inet_pton(AF_INET, endpoint.value().ip.c_str(), &out.sin_addr) != 1) {
+        return Result<sockaddr_in>::err("invalid IPv4 address");
     }
-
-    char* port_end = nullptr;
-    const long port = std::strtol(parts[3].c_str(), &port_end, 10);
-    if (port_end == nullptr || *port_end != '\0' || port < 0 || port > 65535) {
-        return Result<SocketAddress>::err("invalid tcp port");
-    }
-
-    SocketAddress out;
-    out.addr.sin_family = AF_INET;
-    out.addr.sin_port = htons(static_cast<uint16_t>(port));
-    if (::inet_pton(AF_INET, parts[1].c_str(), &out.addr.sin_addr) != 1) {
-        return Result<SocketAddress>::err("invalid IPv4 address");
-    }
-    return Result<SocketAddress>::ok(out);
+    return Result<sockaddr_in>::ok(out);
 }
 
-Multiaddr to_multiaddr(const sockaddr_in& addr) {
+Multiaddr from_sockaddr(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {};
     ::inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
-    return Multiaddr(std::string("/ip4/") + ip + "/tcp/" +
-                     std::to_string(ntohs(addr.sin_port)));
+    return Multiaddr::from_ip4_tcp(ip, ntohs(addr.sin_port));
 }
 
 Result<void> set_socket_common_flags(RawFd fd) {
@@ -117,15 +91,15 @@ Result<void> TcpTransport::dial(const Multiaddr& addr, TcpTransportCallbacks cal
     if (socket.is_err()) return Result<void>::err(socket.error().message);
 
     RawFd fd = socket.value();
-    auto parsed = parse_ip4_tcp(addr);
-    if (parsed.is_err()) {
+    auto socket_addr = to_sockaddr(addr);
+    if (socket_addr.is_err()) {
         close_fd(fd);
-        return Result<void>::err(parsed.error().message);
+        return Result<void>::err(socket_addr.error().message);
     }
 
     const int rc = ::connect(fd,
-                             reinterpret_cast<const sockaddr*>(&parsed.value().addr),
-                             parsed.value().len);
+                             reinterpret_cast<const sockaddr*>(&socket_addr.value()),
+                             sizeof(sockaddr_in));
     if (rc == 0) {
         PEERCORE_LOG_DEBUG(kComp, "dial connected immediately fd={} addr={}", fd, addr.to_string());
         if (callbacks.on_connected) {
@@ -181,7 +155,7 @@ void TcpTransport::on_accept_ready(RawFd listen_fd) {
         if (it->callbacks.on_accepted) {
             it->callbacks.on_accepted(TcpSocket{
                 .fd = fd,
-                .remote_addr = to_multiaddr(addr),
+                .remote_addr = from_sockaddr(addr),
             });
         } else {
             close_fd(fd);
@@ -252,7 +226,7 @@ Result<Multiaddr> TcpTransport::local_addr(RawFd fd) const {
         return Result<Multiaddr>::err(std::string("getsockname failed: ") +
                                       std::strerror(errno));
     }
-    return Result<Multiaddr>::ok(to_multiaddr(addr));
+    return Result<Multiaddr>::ok(from_sockaddr(addr));
 }
 
 void TcpTransport::close_all() {
@@ -268,8 +242,8 @@ void TcpTransport::close_all() {
 }
 
 Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
-    auto parsed = parse_ip4_tcp(addr);
-    if (parsed.is_err()) return Result<RawFd>::err(parsed.error().message);
+    auto socket_addr = to_sockaddr(addr);
+    if (socket_addr.is_err()) return Result<RawFd>::err(socket_addr.error().message);
 
     RawFd fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
@@ -284,8 +258,8 @@ Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
     }
 
     if (::bind(fd,
-               reinterpret_cast<const sockaddr*>(&parsed.value().addr),
-               parsed.value().len) < 0) {
+               reinterpret_cast<const sockaddr*>(&socket_addr.value()),
+               sizeof(sockaddr_in)) < 0) {
         const std::string detail = std::strerror(errno);
         close_fd(fd);
         return Result<RawFd>::err(std::string("bind() failed: ") + detail);
@@ -300,8 +274,8 @@ Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
 }
 
 Result<RawFd> TcpTransport::create_connect_socket(const Multiaddr& addr) {
-    auto parsed = parse_ip4_tcp(addr);
-    if (parsed.is_err()) return Result<RawFd>::err(parsed.error().message);
+    auto socket_addr = to_sockaddr(addr);
+    if (socket_addr.is_err()) return Result<RawFd>::err(socket_addr.error().message);
 
     RawFd fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
