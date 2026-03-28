@@ -22,16 +22,26 @@ struct CipherState {
     uint64_t nonce{0};
 };
 
+struct NoiseExtensions {
+    std::vector<ProtocolId> stream_muxers;
+};
+
 struct NoiseSession {
     bool is_initiator{false};
     std::optional<Identity> local_identity;
     std::optional<PeerId>   remote_peer_id;
+    NoiseExtensions         local_extensions;
+    NoiseExtensions         remote_extensions;
 
     // Ephemeral keypair for this session
     NoiseKeypair ephemeral;
     NoiseKeypair static_key;
     std::array<uint8_t, 32> remote_ephemeral_pub{};
     bool has_remote_ephemeral{false};
+    std::array<uint8_t, 32> handshake_ee{};
+    bool has_handshake_ee{false};
+    std::array<uint8_t, 32> handshake_es{};
+    bool has_handshake_es{false};
 
     // Remote static public key (available after handshake)
     std::array<uint8_t, 32> remote_static_pub{};
@@ -41,10 +51,6 @@ struct NoiseSession {
     CipherState cs_recv;
 
     bool handshake_complete{false};
-};
-
-struct NoiseExtensions {
-    std::vector<ProtocolId> stream_muxers;
 };
 
 struct NoiseHandshakePayload {

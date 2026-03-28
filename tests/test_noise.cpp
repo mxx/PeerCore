@@ -80,7 +80,17 @@ TEST(NoiseHandshake, RejectsBadMessages) {
 
     auto done = NoiseHandshake::process_msg3(session, std::vector<uint8_t>{0x02});
     ASSERT_TRUE(done.is_err());
-    EXPECT_EQ(done.error_message(), "ciphertext too short");
+    EXPECT_EQ(done.error_message(), "missing msg3 handshake secret");
+
+    NoiseSession initiator;
+    NoiseSession responder;
+    auto msg1_ok = NoiseHandshake::write_msg1(initiator);
+    auto msg2_ok = NoiseHandshake::process_msg1(responder, msg1_ok);
+    ASSERT_TRUE(msg2_ok.is_ok());
+
+    auto short_msg3 = NoiseHandshake::process_msg3(responder, std::vector<uint8_t>{0x02});
+    ASSERT_TRUE(short_msg3.is_err());
+    EXPECT_EQ(short_msg3.error_message(), "ciphertext too short");
 }
 
 TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
@@ -90,6 +100,8 @@ TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
     NoiseSession responder;
     initiator.local_identity = make_identity();
     responder.local_identity = make_identity();
+    initiator.local_extensions.stream_muxers = {"/yamux/1.0.0"};
+    responder.local_extensions.stream_muxers = {"/mplex/6.7.0", "/yamux/1.0.0"};
 
     auto msg1 = NoiseHandshake::write_msg1(initiator);
     ASSERT_FALSE(msg1.empty());
@@ -102,10 +114,15 @@ TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
     ASSERT_TRUE(msg3.is_ok()) << msg3.error().message;
     ASSERT_TRUE(initiator.remote_peer_id.has_value());
     EXPECT_EQ(*initiator.remote_peer_id, responder.local_identity->peer_id);
+    ASSERT_EQ(initiator.remote_extensions.stream_muxers.size(), 2u);
+    EXPECT_EQ(initiator.remote_extensions.stream_muxers[0], "/mplex/6.7.0");
+    EXPECT_EQ(initiator.remote_extensions.stream_muxers[1], "/yamux/1.0.0");
 
     ASSERT_TRUE(NoiseHandshake::process_msg3(responder, msg3.value()).is_ok());
     ASSERT_TRUE(responder.remote_peer_id.has_value());
     EXPECT_EQ(*responder.remote_peer_id, initiator.local_identity->peer_id);
+    ASSERT_EQ(responder.remote_extensions.stream_muxers.size(), 1u);
+    EXPECT_EQ(responder.remote_extensions.stream_muxers[0], "/yamux/1.0.0");
 }
 
 TEST(NoiseHandshake, HandshakePayloadRoundTripsAndVerifies) {
