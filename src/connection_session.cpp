@@ -541,6 +541,26 @@ private:
         return flush_pending_writes();
     }
 
+    Result<void> validate_expected_remote_peer() const {
+        if (!is_initiator_) return Result<void>::ok();
+
+        auto endpoint = remote_addr_.parse_ip4_tcp();
+        if (endpoint.is_err()) return Result<void>::ok();
+        if (!endpoint.value().peer_id.has_value()) return Result<void>::ok();
+        if (!secure_->noise.remote_peer_id.has_value()) {
+            return Result<void>::err("missing authenticated remote peer id");
+        }
+
+        auto expected = PeerId::from_string(*endpoint.value().peer_id);
+        if (expected.is_err()) {
+            return Result<void>::err("invalid expected remote peer id");
+        }
+        if (expected.value() != *secure_->noise.remote_peer_id) {
+            return Result<void>::err("authenticated peer id does not match dial target");
+        }
+        return Result<void>::ok();
+    }
+
     Result<void> process_handshake_frame(ConstBytes frame) {
         switch (secure_->handshake_state) {
             case HandshakeState::AwaitingMsg1: {
@@ -581,6 +601,9 @@ private:
 
     Result<void> finish_secure_upgrade() {
         if (secure_->secure_ready) return Result<void>::ok();
+
+        auto expected_peer = validate_expected_remote_peer();
+        if (expected_peer.is_err()) return expected_peer;
 
         secure_->stage = SecurityStage::Ready;
         secure_->secure_ready = true;

@@ -203,3 +203,40 @@ TEST(ConnectionSession, RejectsStreamOpenBeforeHandshakeCompletes) {
     sockets.local = -1;
     sockets.peer = -1;
 }
+
+TEST(ConnectionSession, RejectsAuthenticatedPeerThatDiffersFromDialTarget) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto wrong_peer = make_identity().peer_id;
+
+    auto outbound = make_outbound_connection_session(
+        7,
+        sockets.local,
+        Multiaddr::from_ip4_tcp("127.0.0.1", 4001, wrong_peer.to_string()),
+        outbound_identity);
+    auto inbound = make_inbound_connection_session(
+        8, sockets.peer, Multiaddr("/ip4/127.0.0.1/tcp/4002"), inbound_identity);
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Failed ||
+            outbound->state() == ConnectionState::Closed) {
+            break;
+        }
+    }
+
+    EXPECT_EQ(outbound->state(), ConnectionState::Closed);
+    auto outbound_events = drain_events(*outbound);
+    ASSERT_GE(outbound_events.size(), 2u);
+    EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Error);
+    EXPECT_EQ(outbound_events[0].detail, "authenticated peer id does not match dial target");
+    EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::Closed);
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
