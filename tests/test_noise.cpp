@@ -162,6 +162,32 @@ TEST(NoiseHandshake, RejectsInvalidPayloadSignature) {
     EXPECT_EQ(verified.error_message(), "invalid noise static key signature");
 }
 
+TEST(NoiseHandshake, RejectsTamperedHandshakeCiphertexts) {
+    NoiseSession initiator;
+    NoiseSession responder;
+
+    auto msg1 = NoiseHandshake::write_msg1(initiator);
+    auto msg2 = NoiseHandshake::process_msg1(responder, msg1);
+    ASSERT_TRUE(msg2.is_ok());
+
+    auto tampered_msg2 = msg2.value();
+    tampered_msg2.back() ^= 0x01;
+    auto bad_msg2 = NoiseHandshake::process_msg2(initiator, tampered_msg2);
+    ASSERT_TRUE(bad_msg2.is_err());
+    EXPECT_EQ(bad_msg2.error().message, "noise::decrypt failed");
+    EXPECT_FALSE(initiator.handshake_complete);
+
+    auto msg3 = NoiseHandshake::process_msg2(initiator, msg2.value());
+    ASSERT_TRUE(msg3.is_ok());
+
+    auto tampered_msg3 = msg3.value();
+    tampered_msg3.back() ^= 0x01;
+    auto bad_msg3 = NoiseHandshake::process_msg3(responder, tampered_msg3);
+    ASSERT_TRUE(bad_msg3.is_err());
+    EXPECT_EQ(bad_msg3.error_message(), "noise::decrypt failed");
+    EXPECT_FALSE(responder.handshake_complete);
+}
+
 TEST(NoiseHandshake, FramesMessagesWithTwoByteLengthPrefix) {
     const std::vector<uint8_t> msg{'n', 'o', 'i', 's', 'e'};
     auto framed = NoiseHandshake::encode_frame(msg);
