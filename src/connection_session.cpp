@@ -1,5 +1,6 @@
 #include "../include/peercore/connection_session.hpp"
 
+#include "protocol/multistream_select.hpp"
 #include "protocol/noise/noise.hpp"
 
 #include <algorithm>
@@ -16,6 +17,7 @@ namespace {
 
 using protocol::noise::NoiseHandshake;
 using protocol::noise::NoiseSession;
+using protocol::MultistreamSelect;
 
 enum class HandshakeState {
     Idle,
@@ -23,6 +25,12 @@ enum class HandshakeState {
     AwaitingMsg2,
     AwaitingMsg3,
     Complete,
+};
+
+enum class SecurityStage {
+    NegotiatingProtocol,
+    NoiseHandshake,
+    Ready,
 };
 
 struct SessionIoState {
@@ -36,9 +44,10 @@ struct SessionIoState {
 };
 
 struct SecureChannelState {
-    NoiseSession  noise;
+    NoiseSession   noise;
+    SecurityStage  stage{SecurityStage::NegotiatingProtocol};
     HandshakeState handshake_state{HandshakeState::Idle};
-    bool           secure_ready{false};
+    bool            secure_ready{false};
 };
 
 struct StreamState {
@@ -69,6 +78,11 @@ Result<void> queue_wire_message(SessionIoState& io, ConstBytes message) {
     io.wire_tx_buffer.insert(io.wire_tx_buffer.end(),
                              framed.value().begin(),
                              framed.value().end());
+    return Result<void>::ok();
+}
+
+Result<void> queue_raw_bytes(SessionIoState& io, ConstBytes bytes) {
+    io.wire_tx_buffer.insert(io.wire_tx_buffer.end(), bytes.begin(), bytes.end());
     return Result<void>::ok();
 }
 
@@ -138,6 +152,50 @@ bool try_pop_wire_frame(std::vector<uint8_t>& buffer,
     frame = std::move(decoded.value());
     buffer.erase(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(total));
     return true;
+}
+
+Result<uint64_t> decode_multistream_length(ConstBytes& buf) {
+    uint64_t value = 0;
+    uint32_t shift = 0;
+    size_t index = 0;
+    while (index < buf.size()) {
+        const uint8_t byte = buf[index++];
+        value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+            buf = buf.subspan(index);
+            return Result<uint64_t>::ok(value);
+        }
+        shift += 7;
+        if (shift >= 64) {
+            return Result<uint64_t>::err("invalid multistream length");
+        }
+    }
+    return Result<uint64_t>::err("incomplete multistream length");
+}
+
+bool is_incomplete_multistream_error(std::string_view error) {
+    return error == "incomplete multistream length" ||
+           error == "incomplete multistream message";
+}
+
+Result<size_t> multistream_message_span(ConstBytes buf) {
+    auto remaining = buf;
+    auto len = decode_multistream_length(remaining);
+    if (len.is_err()) return Result<size_t>::err(len.error().message);
+    if (remaining.size() < len.value()) {
+        return Result<size_t>::err("incomplete multistream message");
+    }
+    return Result<size_t>::ok(buf.size() - remaining.size() + len.value());
+}
+
+Result<size_t> multistream_exchange_span(ConstBytes buf) {
+    auto first = multistream_message_span(buf);
+    if (first.is_err()) return first;
+    buf = buf.subspan(first.value());
+
+    auto second = multistream_message_span(buf);
+    if (second.is_err()) return second;
+    return Result<size_t>::ok(first.value() + second.value());
 }
 
 Result<size_t> queue_encrypted_write(StreamState& state, ConstBytes data) {
@@ -295,12 +353,12 @@ public:
 
         state_ = ConnectionState::Securing;
         create_inbound_stream_on_ready_ = false;
+        secure_->stage = SecurityStage::NegotiatingProtocol;
+        secure_->handshake_state = HandshakeState::Idle;
 
-        auto msg1 = NoiseHandshake::write_msg1(secure_->noise);
-        if (msg1.empty()) return Result<void>::err("failed to start noise handshake");
-
-        secure_->handshake_state = HandshakeState::AwaitingMsg2;
-        auto queued = queue_wire_message(*io_, msg1);
+        auto proposal = MultistreamSelect::prepare_outbound({"/noise"});
+        if (proposal.is_err()) return Result<void>::err(proposal.error().message);
+        auto queued = queue_raw_bytes(*io_, proposal.value());
         if (queued.is_err()) return queued;
         return flush_pending_writes();
     }
@@ -312,7 +370,8 @@ public:
 
         state_ = ConnectionState::Securing;
         create_inbound_stream_on_ready_ = true;
-        secure_->handshake_state = HandshakeState::AwaitingMsg1;
+        secure_->stage = SecurityStage::NegotiatingProtocol;
+        secure_->handshake_state = HandshakeState::Idle;
         return Result<void>::ok();
     }
 
@@ -381,7 +440,12 @@ private:
     }
 
     Result<void> process_pending_input() {
-        if (!secure_->secure_ready) {
+        if (secure_->stage == SecurityStage::NegotiatingProtocol) {
+            auto protocol = process_protocol_negotiation();
+            if (protocol.is_err()) return protocol;
+        }
+
+        if (!secure_->secure_ready && secure_->stage == SecurityStage::NoiseHandshake) {
             while (!secure_->secure_ready) {
                 std::vector<uint8_t> frame;
                 std::string error;
@@ -415,6 +479,66 @@ private:
         }
 
         return Result<void>::ok();
+    }
+
+    Result<void> process_protocol_negotiation() {
+        if (is_initiator_) {
+            auto span = multistream_exchange_span(io_->wire_rx_buffer);
+            if (span.is_err()) {
+                if (is_incomplete_multistream_error(span.error().message)) {
+                    return Result<void>::ok();
+                }
+                return Result<void>::err(span.error().message);
+            }
+
+            ConstBytes incoming(io_->wire_rx_buffer.data(), span.value());
+            auto selected = MultistreamSelect::read_outbound_response(incoming, "/noise");
+            if (selected.is_err()) return Result<void>::err(selected.error().message);
+
+            io_->wire_rx_buffer.erase(
+                io_->wire_rx_buffer.begin(),
+                io_->wire_rx_buffer.begin() + static_cast<std::ptrdiff_t>(span.value()));
+            return start_noise_handshake();
+        }
+
+        auto span = multistream_exchange_span(io_->wire_rx_buffer);
+        if (span.is_err()) {
+            if (is_incomplete_multistream_error(span.error().message)) {
+                return Result<void>::ok();
+            }
+            return Result<void>::err(span.error().message);
+        }
+
+        ConstBytes incoming(io_->wire_rx_buffer.data(), span.value());
+        auto negotiated = MultistreamSelect::negotiate_inbound(incoming, {"/noise"});
+        if (negotiated.is_err()) return Result<void>::err(negotiated.error().message);
+        if (!negotiated.value().protocol.has_value() ||
+            *negotiated.value().protocol != "/noise") {
+            return Result<void>::err("noise protocol negotiation failed");
+        }
+
+        auto queued = queue_raw_bytes(*io_, negotiated.value().outbound);
+        if (queued.is_err()) return queued;
+        auto flush = flush_pending_writes();
+        if (flush.is_err()) return flush;
+
+        io_->wire_rx_buffer.erase(
+            io_->wire_rx_buffer.begin(),
+            io_->wire_rx_buffer.begin() + static_cast<std::ptrdiff_t>(span.value()));
+        secure_->stage = SecurityStage::NoiseHandshake;
+        secure_->handshake_state = HandshakeState::AwaitingMsg1;
+        return Result<void>::ok();
+    }
+
+    Result<void> start_noise_handshake() {
+        auto msg1 = NoiseHandshake::write_msg1(secure_->noise);
+        if (msg1.empty()) return Result<void>::err("failed to start noise handshake");
+
+        secure_->stage = SecurityStage::NoiseHandshake;
+        secure_->handshake_state = HandshakeState::AwaitingMsg2;
+        auto queued = queue_wire_message(*io_, msg1);
+        if (queued.is_err()) return queued;
+        return flush_pending_writes();
     }
 
     Result<void> process_handshake_frame(ConstBytes frame) {
@@ -458,6 +582,7 @@ private:
     Result<void> finish_secure_upgrade() {
         if (secure_->secure_ready) return Result<void>::ok();
 
+        secure_->stage = SecurityStage::Ready;
         secure_->secure_ready = true;
         state_ = ConnectionState::SecureReady;
         event_queue_.push_back(ConnectionEvent{
