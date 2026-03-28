@@ -2,7 +2,7 @@
 
 #include "../../include/peercore/types.hpp"
 
-#include <functional>
+#include <optional>
 #include <vector>
 
 namespace peercore::protocol {
@@ -10,26 +10,31 @@ namespace peercore::protocol {
 // Implements the multistream-select 1.0 negotiation protocol.
 // https://github.com/multiformats/multistream-select
 
-using NegotiateCallback = std::function<void(Result<ProtocolId>)>;
+struct InboundNegotiation {
+    std::vector<uint8_t> outbound;
+    std::optional<ProtocolId> protocol;
+};
 
 class MultistreamSelect {
 public:
-    // Initiator: propose a list of protocols; callback receives the agreed one
-    static void negotiate_outbound(MutableBytes send_buf,
-                                   const std::vector<ProtocolId>& proposals,
-                                   NegotiateCallback callback);
+    // Build an initiator request for the first proposed protocol.
+    static Result<std::vector<uint8_t>> prepare_outbound(
+        const std::vector<ProtocolId>& proposals);
 
-    // Responder: given supported protocols, select the first match
-    static void negotiate_inbound(MutableBytes send_buf,
-                                  ConstBytes incoming,
-                                  const std::vector<ProtocolId>& supported,
-                                  NegotiateCallback callback);
+    // Parse the responder's reply for a single proposed protocol.
+    static Result<ProtocolId> read_outbound_response(ConstBytes incoming,
+                                                     std::string_view proposal);
+
+    // Responder: parse one request and build the corresponding reply.
+    static Result<InboundNegotiation> negotiate_inbound(
+        ConstBytes incoming,
+        const std::vector<ProtocolId>& supported);
 
 private:
-    static constexpr std::string_view kHeader = "/multistream/1.0.0\n";
+    static constexpr std::string_view kHeader = "/multistream/1.0.0";
 
     static std::vector<uint8_t> encode_message(std::string_view msg);
-    static std::string          decode_next(ConstBytes& buf);
+    static Result<std::string>  decode_next(ConstBytes& buf);
 };
 
 }  // namespace peercore::protocol

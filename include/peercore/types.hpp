@@ -2,6 +2,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,6 +23,7 @@ struct PeerId {
     bool operator==(const PeerId&) const = default;
     std::string to_string() const;
     static PeerId from_bytes(std::span<const uint8_t, 32> b);
+    static Result<PeerId> from_string(std::string_view text);
 };
 
 struct Identity {
@@ -36,6 +38,7 @@ struct Multiaddr {
     struct Ip4TcpEndpoint {
         std::string ip;
         uint16_t    port{0};
+        std::optional<std::string> peer_id;
     };
 
     std::vector<uint8_t> bytes;
@@ -45,6 +48,9 @@ struct Multiaddr {
 
     Result<Ip4TcpEndpoint> parse_ip4_tcp() const;
     static Multiaddr from_ip4_tcp(std::string_view ip, uint16_t port);
+    static Multiaddr from_ip4_tcp(std::string_view ip,
+                                  uint16_t port,
+                                  std::string_view peer_id);
 };
 
 // ── Handles & IDs ─────────────────────────────────────────────────────────────

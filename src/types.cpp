@@ -1,8 +1,10 @@
 #include "../include/peercore/types.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <cctype>
 #include <iomanip>
 #include <sstream>
 
@@ -10,8 +12,10 @@ namespace peercore {
 
 namespace {
 
+constexpr std::string_view kPeerIdPrefix = "12D3KooW";
+
 Result<Multiaddr::Ip4TcpEndpoint> parse_ip4_tcp_text(std::string_view text) {
-    std::array<std::string, 5> parts{};
+    std::array<std::string, 7> parts{};
 
     size_t start = 0;
     size_t index = 0;
@@ -25,9 +29,9 @@ Result<Multiaddr::Ip4TcpEndpoint> parse_ip4_tcp_text(std::string_view text) {
         start = slash + 1;
     }
 
-    if (index != 4 || parts[0] != "ip4" || parts[2] != "tcp") {
+    if ((index != 4 && index != 6) || parts[0] != "ip4" || parts[2] != "tcp") {
         return Result<Multiaddr::Ip4TcpEndpoint>::err(
-            "only /ip4/<addr>/tcp/<port> is supported");
+            "only /ip4/<addr>/tcp/<port>[/p2p/<peer-id>] is supported");
     }
 
     char* port_end = nullptr;
@@ -36,9 +40,24 @@ Result<Multiaddr::Ip4TcpEndpoint> parse_ip4_tcp_text(std::string_view text) {
         return Result<Multiaddr::Ip4TcpEndpoint>::err("invalid tcp port");
     }
 
+    std::optional<std::string> peer_id;
+    if (index == 6) {
+        if (parts[4] != "p2p" || parts[5].empty()) {
+            return Result<Multiaddr::Ip4TcpEndpoint>::err("invalid p2p peer id");
+        }
+        peer_id = std::move(parts[5]);
+    }
+
     return Result<Multiaddr::Ip4TcpEndpoint>::ok(Multiaddr::Ip4TcpEndpoint{
         .ip = std::move(parts[1]),
         .port = static_cast<uint16_t>(port),
+        .peer_id = std::move(peer_id),
+    });
+}
+
+bool is_lower_hex(std::string_view text) {
+    return std::all_of(text.begin(), text.end(), [](unsigned char c) {
+        return std::isdigit(c) || (c >= 'a' && c <= 'f');
     });
 }
 
@@ -62,6 +81,24 @@ PeerId PeerId::from_bytes(std::span<const uint8_t, 32> b) {
     return p;
 }
 
+Result<PeerId> PeerId::from_string(std::string_view text) {
+    if (!text.starts_with(kPeerIdPrefix)) {
+        return Result<PeerId>::err("unsupported peer id format");
+    }
+
+    const auto hex = text.substr(kPeerIdPrefix.size());
+    if (hex.size() != 64 || !is_lower_hex(hex)) {
+        return Result<PeerId>::err("invalid peer id payload");
+    }
+
+    PeerId p;
+    for (size_t i = 0; i < p.bytes.size(); ++i) {
+        const auto byte_text = hex.substr(i * 2, 2);
+        p.bytes[i] = static_cast<uint8_t>(std::strtoul(std::string(byte_text).c_str(), nullptr, 16));
+    }
+    return Result<PeerId>::ok(p);
+}
+
 // ── Multiaddr ─────────────────────────────────────────────────────────────────
 
 Multiaddr::Multiaddr(std::string_view text) {
@@ -81,6 +118,14 @@ Result<Multiaddr::Ip4TcpEndpoint> Multiaddr::parse_ip4_tcp() const {
 Multiaddr Multiaddr::from_ip4_tcp(std::string_view ip, uint16_t port) {
     return Multiaddr(std::string("/ip4/") + std::string(ip) +
                      "/tcp/" + std::to_string(port));
+}
+
+Multiaddr Multiaddr::from_ip4_tcp(std::string_view ip,
+                                  uint16_t port,
+                                  std::string_view peer_id) {
+    return Multiaddr(std::string("/ip4/") + std::string(ip) +
+                     "/tcp/" + std::to_string(port) +
+                     "/p2p/" + std::string(peer_id));
 }
 
 }  // namespace peercore

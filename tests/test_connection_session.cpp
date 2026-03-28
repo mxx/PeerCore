@@ -3,9 +3,12 @@
 
 #include <array>
 #include <fcntl.h>
+#include <sodium.h>
 #include <stdexcept>
+#include <string>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <vector>
 
 using namespace peercore;
 
@@ -39,92 +42,164 @@ struct SocketPair {
     }
 };
 
-}  // namespace
-
-TEST(ConnectionSession, OutboundUpgradeAndStreamIo) {
-    SocketPair sockets;
-    auto session = make_outbound_connection_session(
-        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"));
-
-    ASSERT_TRUE(session->begin_outbound_upgrade().is_ok());
-
-    auto ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::Secured);
-
-    ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::MultiplexerReady);
-
-    auto stream_res = session->request_open_stream("/test/1.0.0");
-    ASSERT_TRUE(stream_res.is_ok());
-    auto stream = stream_res.value();
-
-    ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::StreamOpened);
-    ASSERT_TRUE(ev->stream_id.has_value());
-    EXPECT_EQ(stream->id(), *ev->stream_id);
-
-    const char inbound[] = "ping";
-    ASSERT_EQ(::write(sockets.peer, inbound, sizeof(inbound) - 1), sizeof(inbound) - 1);
-    session->on_socket_readable();
-
-    std::array<uint8_t, 16> read_buf{};
-    auto read_res = stream->try_read(read_buf);
-    ASSERT_TRUE(read_res.is_ok());
-    EXPECT_EQ(read_res.value(), sizeof(inbound) - 1);
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_res.value()), "ping");
-
-    const std::array<uint8_t, 4> outbound{{'p', 'o', 'n', 'g'}};
-    auto write_res = stream->try_write(outbound);
-    ASSERT_TRUE(write_res.is_ok());
-    EXPECT_EQ(write_res.value(), outbound.size());
-
-    char peer_buf[16]{};
-    const ssize_t n = ::read(sockets.peer, peer_buf, sizeof(peer_buf));
-    ASSERT_EQ(n, static_cast<ssize_t>(outbound.size()));
-    EXPECT_EQ(std::string(peer_buf, peer_buf + n), "pong");
-
-    session->close();
-    ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::Closed);
-
-    sockets.local = -1;
+Identity make_identity() {
+    Identity identity;
+    ::crypto_sign_keypair(identity.secret_key.data() + 32, identity.secret_key.data());
+    identity.peer_id = PeerId::from_bytes(
+        std::span<const uint8_t, 32>(identity.secret_key.data() + 32, 32));
+    return identity;
 }
 
-TEST(ConnectionSession, InboundUpgradeCreatesAcceptableStream) {
+std::vector<ConnectionEvent> drain_events(ConnectionSession& session) {
+    std::vector<ConnectionEvent> events;
+    while (auto ev = session.next_event()) {
+        events.push_back(std::move(*ev));
+    }
+    return events;
+}
+
+void drive_sessions(ConnectionSession& a, ConnectionSession& b, int rounds = 8) {
+    for (int i = 0; i < rounds; ++i) {
+        a.on_socket_writable();
+        b.on_socket_writable();
+        a.on_socket_readable();
+        b.on_socket_readable();
+    }
+}
+
+}  // namespace
+
+TEST(ConnectionSession, RunsNoiseHandshakeBeforeReady) {
+    ASSERT_GE(::sodium_init(), 0);
     SocketPair sockets;
-    auto session = make_inbound_connection_session(
-        9, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4002"));
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+    auto inbound = make_inbound_connection_session(
+        8, sockets.peer, Multiaddr("/ip4/127.0.0.1/tcp/4002"), inbound_identity);
 
-    ASSERT_TRUE(session->begin_inbound_upgrade().is_ok());
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
 
-    auto ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::Secured);
+    EXPECT_EQ(outbound->state(), ConnectionState::Securing);
+    EXPECT_EQ(inbound->state(), ConnectionState::Securing);
 
-    ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::MultiplexerReady);
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
 
-    ev = session->next_event();
-    ASSERT_TRUE(ev.has_value());
-    EXPECT_EQ(ev->type, ConnectionEvent::Type::StreamAccepted);
+    EXPECT_EQ(outbound->state(), ConnectionState::Ready);
+    EXPECT_EQ(inbound->state(), ConnectionState::Ready);
+    ASSERT_TRUE(outbound->remote_peer().has_value());
+    ASSERT_TRUE(inbound->remote_peer().has_value());
+    EXPECT_EQ(*outbound->remote_peer(), inbound_identity.peer_id);
+    EXPECT_EQ(*inbound->remote_peer(), outbound_identity.peer_id);
 
-    auto stream = session->accept_inbound_stream();
-    ASSERT_TRUE(stream.has_value());
+    auto outbound_events = drain_events(*outbound);
+    ASSERT_GE(outbound_events.size(), 2u);
+    EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Secured);
+    EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
 
-    const char inbound[] = "hello";
-    ASSERT_EQ(::write(sockets.peer, inbound, sizeof(inbound) - 1), sizeof(inbound) - 1);
-    session->on_socket_readable();
-
-    std::array<uint8_t, 16> read_buf{};
-    auto read_res = (*stream)->try_read(read_buf);
-    ASSERT_TRUE(read_res.is_ok());
-    EXPECT_EQ(read_res.value(), sizeof(inbound) - 1);
-    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_res.value()), "hello");
+    auto inbound_events = drain_events(*inbound);
+    ASSERT_GE(inbound_events.size(), 3u);
+    EXPECT_EQ(inbound_events[0].type, ConnectionEvent::Type::Secured);
+    EXPECT_EQ(inbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
+    EXPECT_EQ(inbound_events[2].type, ConnectionEvent::Type::StreamAccepted);
 
     sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, EncryptsBidirectionalStreamIoAfterHandshake) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+    auto inbound = make_inbound_connection_session(
+        8, sockets.peer, Multiaddr("/ip4/127.0.0.1/tcp/4002"), inbound_identity);
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
+
+    ASSERT_EQ(outbound->state(), ConnectionState::Ready);
+    ASSERT_EQ(inbound->state(), ConnectionState::Ready);
+
+    drain_events(*outbound);
+    drain_events(*inbound);
+
+    auto outbound_stream_res = outbound->request_open_stream("/test/1.0.0");
+    ASSERT_TRUE(outbound_stream_res.is_ok());
+    auto outbound_stream = outbound_stream_res.value();
+
+    auto outbound_events = drain_events(*outbound);
+    ASSERT_FALSE(outbound_events.empty());
+    EXPECT_EQ(outbound_events.front().type, ConnectionEvent::Type::StreamOpened);
+
+    auto inbound_stream = inbound->accept_inbound_stream();
+    ASSERT_TRUE(inbound_stream.has_value());
+
+    const std::array<uint8_t, 4> ping{{'p', 'i', 'n', 'g'}};
+    auto write_ping = outbound_stream->try_write(ping);
+    ASSERT_TRUE(write_ping.is_ok());
+    EXPECT_EQ(write_ping.value(), ping.size());
+
+    drive_sessions(*outbound, *inbound);
+
+    std::array<uint8_t, 16> read_buf{};
+    auto read_ping = (*inbound_stream)->try_read(read_buf);
+    ASSERT_TRUE(read_ping.is_ok());
+    EXPECT_EQ(read_ping.value(), ping.size());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_ping.value()), "ping");
+
+    const std::array<uint8_t, 4> pong{{'p', 'o', 'n', 'g'}};
+    auto write_pong = (*inbound_stream)->try_write(pong);
+    ASSERT_TRUE(write_pong.is_ok());
+    EXPECT_EQ(write_pong.value(), pong.size());
+
+    drive_sessions(*outbound, *inbound);
+
+    read_buf.fill(0);
+    auto read_pong = outbound_stream->try_read(read_buf);
+    ASSERT_TRUE(read_pong.is_ok());
+    EXPECT_EQ(read_pong.value(), pong.size());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_pong.value()), "pong");
+
+    outbound->close();
+    auto closed = outbound->next_event();
+    ASSERT_TRUE(closed.has_value());
+    EXPECT_EQ(closed->type, ConnectionEvent::Type::Closed);
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, RejectsStreamOpenBeforeHandshakeCompletes) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    auto stream_res = outbound->request_open_stream("/test/1.0.0");
+    ASSERT_TRUE(stream_res.is_err());
+    EXPECT_EQ(stream_res.error().message, "connection is not ready");
+
+    sockets.local = -1;
+    sockets.peer = -1;
 }

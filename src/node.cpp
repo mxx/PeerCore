@@ -4,7 +4,7 @@ namespace peercore {
 
 Node::Node(Options opts)
     : opts_(std::move(opts))
-    , swarm_(peer_store_)
+    , swarm_(peer_store_, opts_.identity)
     , dht_(std::make_shared<DhtService>())
     , ping_(std::make_shared<PingService>())
     , identify_(std::make_shared<IdentifyService>()) {

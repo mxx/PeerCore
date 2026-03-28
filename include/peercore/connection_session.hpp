@@ -51,11 +51,13 @@ public:
 std::unique_ptr<ConnectionSession> make_outbound_connection_session(
     ConnectionId id,
     int socket_fd,
-    Multiaddr remote_addr);
+    Multiaddr remote_addr,
+    std::optional<Identity> local_identity = std::nullopt);
 
 std::unique_ptr<ConnectionSession> make_inbound_connection_session(
     ConnectionId id,
     int socket_fd,
-    Multiaddr remote_addr);
+    Multiaddr remote_addr,
+    std::optional<Identity> local_identity = std::nullopt);
 
 }  // namespace peercore
