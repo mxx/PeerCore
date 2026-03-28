@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <peercore/connection_session.hpp>
 
+#include "../src/protocol/multistream_select.hpp"
+
 #include <array>
 #include <fcntl.h>
 #include <sodium.h>
@@ -11,6 +13,7 @@
 #include <vector>
 
 using namespace peercore;
+using namespace peercore::protocol;
 
 namespace {
 
@@ -236,6 +239,40 @@ TEST(ConnectionSession, RejectsAuthenticatedPeerThatDiffersFromDialTarget) {
     EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Error);
     EXPECT_EQ(outbound_events[0].detail, "authenticated peer id does not match dial target");
     EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::Closed);
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, RejectsUnsupportedNoiseNegotiationResponse) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+
+    std::array<uint8_t, 256> request_buf{};
+    const auto request_len = ::read(sockets.peer, request_buf.data(), request_buf.size());
+    ASSERT_GT(request_len, 0);
+
+    ConstBytes request(request_buf.data(), static_cast<size_t>(request_len));
+    auto unsupported = MultistreamSelect::negotiate_inbound(request, {"/yamux/1.0.0"});
+    ASSERT_TRUE(unsupported.is_ok());
+    ASSERT_EQ(::write(sockets.peer,
+                      unsupported.value().outbound.data(),
+                      unsupported.value().outbound.size()),
+              static_cast<ssize_t>(unsupported.value().outbound.size()));
+
+    outbound->on_socket_readable();
+
+    EXPECT_EQ(outbound->state(), ConnectionState::Closed);
+    auto events = drain_events(*outbound);
+    ASSERT_GE(events.size(), 2u);
+    EXPECT_EQ(events[0].type, ConnectionEvent::Type::Error);
+    EXPECT_EQ(events[0].detail, "protocol not supported");
+    EXPECT_EQ(events[1].type, ConnectionEvent::Type::Closed);
 
     sockets.local = -1;
     sockets.peer = -1;
