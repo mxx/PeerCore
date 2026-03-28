@@ -2,6 +2,7 @@
 #include <peercore/connection_session.hpp>
 
 #include "../src/protocol/multistream_select.hpp"
+#include "../src/protocol/noise/noise.hpp"
 
 #include <array>
 #include <fcntl.h>
@@ -14,6 +15,7 @@
 
 using namespace peercore;
 using namespace peercore::protocol;
+using namespace peercore::protocol::noise;
 
 namespace {
 
@@ -272,6 +274,66 @@ TEST(ConnectionSession, RejectsUnsupportedNoiseNegotiationResponse) {
     ASSERT_GE(events.size(), 2u);
     EXPECT_EQ(events[0].type, ConnectionEvent::Type::Error);
     EXPECT_EQ(events[0].detail, "protocol not supported");
+    EXPECT_EQ(events[1].type, ConnectionEvent::Type::Closed);
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, ClosesWhenPeerSendsTamperedNoiseMsg2) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+
+    std::array<uint8_t, 256> negotiation_buf{};
+    const auto negotiation_len = ::read(sockets.peer,
+                                        negotiation_buf.data(),
+                                        negotiation_buf.size());
+    ASSERT_GT(negotiation_len, 0);
+
+    ConstBytes request(negotiation_buf.data(), static_cast<size_t>(negotiation_len));
+    auto negotiated = MultistreamSelect::negotiate_inbound(request, {"/noise"});
+    ASSERT_TRUE(negotiated.is_ok());
+    ASSERT_EQ(::write(sockets.peer,
+                      negotiated.value().outbound.data(),
+                      negotiated.value().outbound.size()),
+              static_cast<ssize_t>(negotiated.value().outbound.size()));
+
+    outbound->on_socket_readable();
+
+    std::array<uint8_t, 256> msg1_buf{};
+    const auto msg1_len = ::read(sockets.peer, msg1_buf.data(), msg1_buf.size());
+    ASSERT_GT(msg1_len, 0);
+
+    auto decoded_msg1 = NoiseHandshake::decode_frame(
+        ConstBytes(msg1_buf.data(), static_cast<size_t>(msg1_len)));
+    ASSERT_TRUE(decoded_msg1.is_ok());
+
+    NoiseSession peer_noise;
+    peer_noise.local_identity = make_identity();
+    auto msg2 = NoiseHandshake::process_msg1(peer_noise, decoded_msg1.value());
+    ASSERT_TRUE(msg2.is_ok());
+    auto tampered_msg2 = msg2.value();
+    tampered_msg2.back() ^= 0x01;
+
+    auto framed_msg2 = NoiseHandshake::encode_frame(tampered_msg2);
+    ASSERT_TRUE(framed_msg2.is_ok());
+    ASSERT_EQ(::write(sockets.peer,
+                      framed_msg2.value().data(),
+                      framed_msg2.value().size()),
+              static_cast<ssize_t>(framed_msg2.value().size()));
+
+    outbound->on_socket_readable();
+
+    EXPECT_EQ(outbound->state(), ConnectionState::Closed);
+    auto events = drain_events(*outbound);
+    ASSERT_GE(events.size(), 2u);
+    EXPECT_EQ(events[0].type, ConnectionEvent::Type::Error);
+    EXPECT_EQ(events[0].detail, "noise::decrypt failed");
     EXPECT_EQ(events[1].type, ConnectionEvent::Type::Closed);
 
     sockets.local = -1;
