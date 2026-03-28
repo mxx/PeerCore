@@ -33,13 +33,12 @@ Result<sockaddr_in> to_sockaddr(const Multiaddr& addr) {
     return Result<sockaddr_in>::ok(out);
 }
 
-Multiaddr from_sockaddr(const sockaddr_in& addr) {
+Result<Multiaddr> from_sockaddr(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {};
     if (::inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip)) == nullptr) {
-        PEERCORE_LOG_ERROR(kComp, "inet_ntop failed: {}", std::strerror(errno));
-        return Multiaddr::from_ip4_tcp("0.0.0.0", ntohs(addr.sin_port));
+        return Result<Multiaddr>::err(std::string("inet_ntop failed: ") + std::strerror(errno));
     }
-    return Multiaddr::from_ip4_tcp(ip, ntohs(addr.sin_port));
+    return Result<Multiaddr>::ok(Multiaddr::from_ip4_tcp(ip, ntohs(addr.sin_port)));
 }
 
 Result<void> set_socket_common_flags(RawFd fd) {
@@ -162,10 +161,17 @@ void TcpTransport::on_accept_ready(RawFd listen_fd) {
             continue;
         }
 
-        const Multiaddr remote = from_sockaddr(addr);
-        PEERCORE_LOG_DEBUG(kComp, "accepted fd={} remote={}", fd, remote.to_string());
+        auto remote = from_sockaddr(addr);
+        if (remote.is_err()) {
+            PEERCORE_LOG_ERROR(kComp, "accepted fd={} remote addr conversion failed: {}",
+                               fd, remote.error().message);
+            close_fd(fd);
+            continue;
+        }
+
+        PEERCORE_LOG_DEBUG(kComp, "accepted fd={} remote={}", fd, remote.value().to_string());
         if (it->callbacks.on_accepted) {
-            it->callbacks.on_accepted(TcpSocket{.fd = fd, .remote_addr = remote});
+            it->callbacks.on_accepted(TcpSocket{.fd = fd, .remote_addr = std::move(remote.value())});
         } else {
             close_fd(fd);
         }
@@ -235,7 +241,7 @@ Result<Multiaddr> TcpTransport::local_addr(RawFd fd) const {
         return Result<Multiaddr>::err(std::string("getsockname failed: ") +
                                       std::strerror(errno));
     }
-    return Result<Multiaddr>::ok(from_sockaddr(addr));
+    return from_sockaddr(addr);
 }
 
 void TcpTransport::close_all() {
