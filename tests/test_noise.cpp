@@ -24,15 +24,15 @@ TEST(NoiseHandshake, CompletesMinimalRoundTrip) {
     NoiseSession responder;
 
     auto msg1 = NoiseHandshake::write_msg1(initiator);
-    ASSERT_GE(msg1.size(), 66u);
+    ASSERT_EQ(msg1.size(), 32u);
 
     auto msg2 = NoiseHandshake::process_msg1(responder, msg1);
     ASSERT_TRUE(msg2.is_ok());
-    ASSERT_GE(msg2.value().size(), 66u);
+    ASSERT_GT(msg2.value().size(), 32u);
 
     auto msg3 = NoiseHandshake::process_msg2(initiator, msg2.value());
     ASSERT_TRUE(msg3.is_ok());
-    ASSERT_EQ(msg3.value().size(), 1u);
+    ASSERT_FALSE(msg3.value().empty());
     ASSERT_TRUE(initiator.handshake_complete);
     ASSERT_FALSE(responder.handshake_complete);
 
@@ -72,15 +72,15 @@ TEST(NoiseHandshake, RejectsBadMessages) {
 
     auto msg2 = NoiseHandshake::process_msg1(session, std::vector<uint8_t>{1, 2, 3});
     ASSERT_TRUE(msg2.is_err());
-    EXPECT_EQ(msg2.error().message, "invalid noise handshake message");
+    EXPECT_EQ(msg2.error().message, "invalid msg1 size");
 
     auto msg3 = NoiseHandshake::process_msg2(session, std::vector<uint8_t>{1, 2, 3});
     ASSERT_TRUE(msg3.is_err());
-    EXPECT_EQ(msg3.error().message, "invalid noise handshake message");
+    EXPECT_EQ(msg3.error().message, "invalid msg2 size");
 
     auto done = NoiseHandshake::process_msg3(session, std::vector<uint8_t>{0x02});
     ASSERT_TRUE(done.is_err());
-    EXPECT_EQ(done.error_message(), "invalid msg3");
+    EXPECT_EQ(done.error_message(), "ciphertext too short");
 }
 
 TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
@@ -96,8 +96,7 @@ TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
 
     auto msg2 = NoiseHandshake::process_msg1(responder, msg1);
     ASSERT_TRUE(msg2.is_ok()) << msg2.error().message;
-    ASSERT_TRUE(responder.remote_peer_id.has_value());
-    EXPECT_EQ(*responder.remote_peer_id, initiator.local_identity->peer_id);
+    EXPECT_FALSE(responder.remote_peer_id.has_value());
 
     auto msg3 = NoiseHandshake::process_msg2(initiator, msg2.value());
     ASSERT_TRUE(msg3.is_ok()) << msg3.error().message;
@@ -105,6 +104,8 @@ TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
     EXPECT_EQ(*initiator.remote_peer_id, responder.local_identity->peer_id);
 
     ASSERT_TRUE(NoiseHandshake::process_msg3(responder, msg3.value()).is_ok());
+    ASSERT_TRUE(responder.remote_peer_id.has_value());
+    EXPECT_EQ(*responder.remote_peer_id, initiator.local_identity->peer_id);
 }
 
 TEST(NoiseHandshake, HandshakePayloadRoundTripsAndVerifies) {

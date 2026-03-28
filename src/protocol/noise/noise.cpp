@@ -203,41 +203,45 @@ Result<NoiseExtensions> parse_extensions(ConstBytes bytes) {
     return Result<NoiseExtensions>::ok(std::move(extensions));
 }
 
-std::vector<uint8_t> serialize_handshake_message(const NoiseSession& session,
-                                                 ConstBytes payload = {}) {
+Result<std::vector<uint8_t>> make_local_payload(const NoiseSession& session) {
+    if (!session.local_identity.has_value()) {
+        return Result<std::vector<uint8_t>>::ok({});
+    }
+    return NoiseHandshake::make_handshake_payload(*session.local_identity, session.static_key);
+}
+
+Result<std::vector<uint8_t>> serialize_static_payload_message(const NoiseSession& session) {
+    auto payload = make_local_payload(session);
+    if (payload.is_err()) return payload;
+
     std::vector<uint8_t> out;
-    out.reserve(66 + payload.size());
-    out.insert(out.end(),
-               session.ephemeral.public_key.begin(),
-               session.ephemeral.public_key.end());
+    out.reserve(34 + payload.value().size());
     out.insert(out.end(),
                session.static_key.public_key.begin(),
                session.static_key.public_key.end());
-    const uint16_t payload_len = static_cast<uint16_t>(payload.size());
+    const uint16_t payload_len = static_cast<uint16_t>(payload.value().size());
     out.push_back(static_cast<uint8_t>((payload_len >> 8) & 0xFF));
     out.push_back(static_cast<uint8_t>(payload_len & 0xFF));
-    out.insert(out.end(), payload.begin(), payload.end());
-    return out;
+    out.insert(out.end(), payload.value().begin(), payload.value().end());
+    return Result<std::vector<uint8_t>>::ok(std::move(out));
 }
 
-Result<void> parse_handshake_message(NoiseSession& session,
+Result<void> parse_static_payload_message(NoiseSession& session,
                                      ConstBytes msg,
                                      std::vector<uint8_t>& payload) {
-    if (msg.size() < 66) {
-        return Result<void>::err("invalid noise handshake message");
+    if (msg.size() < 34) {
+        return Result<void>::err("invalid noise static payload");
     }
 
-    std::copy_n(msg.begin(), 32, session.remote_ephemeral_pub.begin());
-    std::copy_n(msg.begin() + 32, 32, session.remote_static_pub.begin());
-    session.has_remote_ephemeral = true;
+    std::copy_n(msg.begin(), 32, session.remote_static_pub.begin());
 
     const uint16_t payload_len = static_cast<uint16_t>(
-        (static_cast<uint16_t>(msg[64]) << 8) | msg[65]);
-    if (msg.size() != static_cast<size_t>(payload_len) + 66) {
-        return Result<void>::err("invalid noise handshake message");
+        (static_cast<uint16_t>(msg[32]) << 8) | msg[33]);
+    if (msg.size() != static_cast<size_t>(payload_len) + 34) {
+        return Result<void>::err("invalid noise static payload");
     }
 
-    payload.assign(msg.begin() + 66, msg.end());
+    payload.assign(msg.begin() + 34, msg.end());
     return Result<void>::ok();
 }
 
@@ -260,14 +264,6 @@ Result<void> verify_remote_identity(NoiseSession& session, ConstBytes payload_by
     session.remote_peer_id = PeerId::from_bytes(identity_pub.value());
     return Result<void>::ok();
 }
-
-Result<std::vector<uint8_t>> make_local_payload(const NoiseSession& session) {
-    if (!session.local_identity.has_value()) {
-        return Result<std::vector<uint8_t>>::ok({});
-    }
-    return NoiseHandshake::make_handshake_payload(*session.local_identity, session.static_key);
-}
-
 }  // namespace
 
 NoiseKeypair NoiseHandshake::generate_keypair() {
@@ -285,9 +281,8 @@ std::vector<uint8_t> NoiseHandshake::write_msg1(NoiseSession& session) {
     session.is_initiator = true;
     session.ephemeral = generate_keypair();
     session.static_key = generate_keypair();
-    auto payload = make_local_payload(session);
-    if (payload.is_err()) return {};
-    return serialize_handshake_message(session, payload.value());
+    return std::vector<uint8_t>(session.ephemeral.public_key.begin(),
+                                session.ephemeral.public_key.end());
 }
 
 Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
@@ -296,17 +291,12 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
+    if (msg1.size() != 32) {
+        return Result<std::vector<uint8_t>>::err("invalid msg1 size");
+    }
     session.is_initiator = false;
-    std::vector<uint8_t> remote_payload;
-    auto parsed = parse_handshake_message(session, msg1, remote_payload);
-    if (parsed.is_err()) {
-        return Result<std::vector<uint8_t>>::err(parsed.error_message());
-    }
-
-    auto verified = verify_remote_identity(session, remote_payload);
-    if (verified.is_err()) {
-        return Result<std::vector<uint8_t>>::err(verified.error_message());
-    }
+    std::copy_n(msg1.begin(), 32, session.remote_ephemeral_pub.begin());
+    session.has_remote_ephemeral = true;
 
     session.ephemeral = generate_keypair();
     session.static_key = generate_keypair();
@@ -316,11 +306,19 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
         return Result<std::vector<uint8_t>>::err(keys.error_message());
     }
 
-    auto payload = make_local_payload(session);
-    if (payload.is_err()) {
-        return Result<std::vector<uint8_t>>::err(payload.error().message);
+    auto plaintext = serialize_static_payload_message(session);
+    if (plaintext.is_err()) {
+        return Result<std::vector<uint8_t>>::err(plaintext.error().message);
     }
-    return Result<std::vector<uint8_t>>::ok(serialize_handshake_message(session, payload.value()));
+    auto ciphertext = NoiseHandshake::encrypt(session.cs_send, plaintext.value());
+    if (ciphertext.is_err()) {
+        return Result<std::vector<uint8_t>>::err(ciphertext.error().message);
+    }
+
+    std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
+                             session.ephemeral.public_key.end());
+    out.insert(out.end(), ciphertext.value().begin(), ciphertext.value().end());
+    return Result<std::vector<uint8_t>>::ok(std::move(out));
 }
 
 Result<std::vector<uint8_t>> NoiseHandshake::process_msg2(NoiseSession& session,
@@ -329,30 +327,50 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg2(NoiseSession& session,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
-    std::vector<uint8_t> remote_payload;
-    auto parsed = parse_handshake_message(session, msg2, remote_payload);
-    if (parsed.is_err()) {
-        return Result<std::vector<uint8_t>>::err(parsed.error_message());
+    if (msg2.size() < 32) {
+        return Result<std::vector<uint8_t>>::err("invalid msg2 size");
     }
-
-    auto verified = verify_remote_identity(session, remote_payload);
-    if (verified.is_err()) {
-        return Result<std::vector<uint8_t>>::err(verified.error_message());
-    }
+    std::copy_n(msg2.begin(), 32, session.remote_ephemeral_pub.begin());
+    session.has_remote_ephemeral = true;
 
     auto keys = derive_transport_keys(session);
     if (keys.is_err()) {
         return Result<std::vector<uint8_t>>::err(keys.error_message());
     }
 
+    ConstBytes ciphertext(msg2.data() + 32, msg2.size() - 32);
+    auto plaintext = NoiseHandshake::decrypt(session.cs_recv, ciphertext);
+    if (plaintext.is_err()) {
+        return Result<std::vector<uint8_t>>::err(plaintext.error().message);
+    }
+
+    std::vector<uint8_t> remote_payload;
+    auto parsed = parse_static_payload_message(session, plaintext.value(), remote_payload);
+    if (parsed.is_err()) {
+        return Result<std::vector<uint8_t>>::err(parsed.error_message());
+    }
+    auto verified = verify_remote_identity(session, remote_payload);
+    if (verified.is_err()) {
+        return Result<std::vector<uint8_t>>::err(verified.error_message());
+    }
+
     session.handshake_complete = true;
-    return Result<std::vector<uint8_t>>::ok(std::vector<uint8_t>{0x01});
+    auto response_plaintext = serialize_static_payload_message(session);
+    if (response_plaintext.is_err()) {
+        return Result<std::vector<uint8_t>>::err(response_plaintext.error().message);
+    }
+    return NoiseHandshake::encrypt(session.cs_send, response_plaintext.value());
 }
 
 Result<void> NoiseHandshake::process_msg3(NoiseSession& session, ConstBytes msg3) {
-    if (msg3.size() != 1 || msg3[0] != 0x01) {
-        return Result<void>::err("invalid msg3");
-    }
+    auto plaintext = NoiseHandshake::decrypt(session.cs_recv, msg3);
+    if (plaintext.is_err()) return Result<void>::err(plaintext.error().message);
+
+    std::vector<uint8_t> remote_payload;
+    auto parsed = parse_static_payload_message(session, plaintext.value(), remote_payload);
+    if (parsed.is_err()) return Result<void>::err(parsed.error_message());
+    auto verified = verify_remote_identity(session, remote_payload);
+    if (verified.is_err()) return verified;
 
     session.handshake_complete = true;
     return Result<void>::ok();
