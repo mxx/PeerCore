@@ -64,15 +64,21 @@ Expected output:
 ```
 Test project .../PeerCore/build
     Start 1: test_types
-1/4 Test #1: test_types ...............   Passed
+1/7 Test #1: test_types ...............   Passed
     Start 2: test_peer_store
-2/4 Test #2: test_peer_store ..........   Passed
+2/7 Test #2: test_peer_store ..........   Passed
     Start 3: test_routing_table
-3/4 Test #3: test_routing_table .......   Passed
+3/7 Test #3: test_routing_table .......   Passed
     Start 4: test_swarm
-4/4 Test #4: test_swarm ...............   Passed
+4/7 Test #4: test_swarm ...............   Passed
+    Start 5: test_event_loop
+5/7 Test #5: test_event_loop ..........   Passed
+    Start 6: test_tcp_transport
+6/7 Test #6: test_tcp_transport .......   Passed
+    Start 7: test_connection_session
+7/7 Test #7: test_connection_session .. Passed
 
-100% tests passed, 0 tests failed out of 4
+100% tests passed, 0 tests failed out of 7
 ```
 
 ## Project Structure
@@ -83,7 +89,13 @@ PeerCore/
 ├── cmake/
 │   └── FindLibsodium.cmake
 ├── doc/
-│   └── architecture.md
+│   ├── architecture.md
+│   ├── types.md
+│   ├── swarm.md
+│   ├── connection_session.md
+│   ├── transport/
+│   ├── runtime/
+│   └── services/
 ├── include/peercore/          # Public API headers
 │   ├── types.hpp              # PeerId, Multiaddr, Result<T>, ...
 │   ├── events.hpp             # SwarmEvent, ConnectionEvent, Action
@@ -111,7 +123,10 @@ PeerCore/
     ├── test_types.cpp
     ├── test_peer_store.cpp
     ├── test_routing_table.cpp
-    └── test_swarm.cpp
+    ├── test_swarm.cpp
+    ├── test_event_loop.cpp
+    ├── test_tcp_transport.cpp
+    └── test_connection_session.cpp
 ```
 
 ## Coverage
@@ -144,12 +159,14 @@ HTML report: `build-cov/coverage/html/index.html`
 
 | Module | Status |
 |--------|--------|
-| Types / Result | Done |
-| PeerStore | Done |
-| RoutingTable (Kademlia) | Done |
-| Swarm (scaffold) | Done |
-| Event loop (kqueue/epoll) | Done |
-| TCP transport | Stub |
+| Types / Result | Partial (minimal `PeerId`, `Multiaddr`, `Result`) |
+| PeerStore | Basic implementation |
+| RoutingTable | Basic XOR nearest-peer table (not full Kademlia) |
+| Node | Thin orchestration scaffold |
+| Swarm | Scaffold only |
+| ConnectionSession | Minimal direct-stream implementation |
+| Event loop (kqueue/epoll) | Minimal implementation |
+| TCP transport | Minimal implementation |
 | multistream-select | Stub |
 | Noise handshake | Stub |
 | Yamux multiplexer | Stub |
@@ -161,11 +178,12 @@ HTML report: `build-cov/coverage/html/index.html`
 
 Per the architecture design, modules are implemented in this sequence:
 
-1. Runtime (event loop) ✓
-2. TCP transport
-3. multistream-select
-4. Noise
-5. Yamux
-6. Identify
-7. Ping
-8. Kad (minimal)
+1. Runtime (event loop) - minimal implementation present
+2. TCP transport - minimal implementation present
+3. ConnectionSession - minimal implementation present
+4. multistream-select - pending
+5. Noise - pending
+6. Yamux - pending
+7. Identify - pending
+8. Ping - pending
+9. Kad / DHT - pending
