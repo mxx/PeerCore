@@ -97,6 +97,8 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     bool client_established = false;
     bool server_identified = false;
     bool client_identified = false;
+    bool client_stream_opened = false;
+    bool stream_open_requested = false;
 
     for (int i = 0; i < 100; ++i) {
         server.poll_once();
@@ -122,10 +124,19 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
                 ev.peer_id == std::optional<PeerId>(server_identity.peer_id)) {
                 client_established = true;
             }
+            if (ev.type == SwarmEvent::Type::StreamOpened) {
+                client_stream_opened = true;
+            }
+        }
+
+        if (!stream_open_requested && client_established) {
+            auto stream = client.open_stream(server_identity.peer_id, "/test/1.0.0");
+            ASSERT_TRUE(stream.is_ok()) << stream.error().message;
+            stream_open_requested = true;
         }
 
         if (server_incoming && server_established && client_established &&
-            server_identified && client_identified) break;
+            server_identified && client_identified && client_stream_opened) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -134,4 +145,5 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     EXPECT_TRUE(server_established);
     EXPECT_TRUE(client_identified);
     EXPECT_TRUE(client_established);
+    EXPECT_TRUE(client_stream_opened);
 }

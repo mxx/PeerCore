@@ -39,6 +39,7 @@ public:
 
     // Streams
     Result<StreamHandle> open_stream(ConnectionId conn_id, ProtocolId proto);
+    Result<StreamHandle> open_stream(const PeerId& peer, ProtocolId proto);
 
     // Protocol registration
     void register_handler(std::shared_ptr<ProtocolHandler> handler);
@@ -62,6 +63,8 @@ private:
     std::unordered_map<ConnectionId, std::unique_ptr<ConnectionSession>> connections_;
     std::unordered_map<ConnectionId, int> conn_fds_;
     std::unordered_map<int, ConnectionId> fd_to_conn_;
+    std::unordered_map<std::string, ConnectionId> peer_connections_;
+    std::unordered_map<ConnectionId, std::string> connection_peers_;
     std::unordered_set<int> listener_fds_;
     std::unordered_set<int> dialing_fds_;
     std::vector<std::shared_ptr<ProtocolHandler>> handlers_;

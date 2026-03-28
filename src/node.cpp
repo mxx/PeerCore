@@ -37,10 +37,9 @@ Result<void> Node::connect(const Multiaddr& addr) {
     return swarm_.dial_addr(addr);
 }
 
-Result<StreamHandle> Node::open_stream(const PeerId& /*peer*/,
-                                        const ProtocolId& /*proto*/) {
-    // TODO: look up existing connection for peer, then open stream
-    return Result<StreamHandle>::err("Node::open_stream not implemented");
+Result<StreamHandle> Node::open_stream(const PeerId& peer,
+                                       const ProtocolId& proto) {
+    return swarm_.open_stream(peer, proto);
 }
 
 DhtService&      Node::dht()      { return *dht_; }

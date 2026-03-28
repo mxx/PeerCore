@@ -47,6 +47,8 @@ Result<void> Swarm::stop() {
     }
     fd_to_conn_.clear();
     conn_fds_.clear();
+    peer_connections_.clear();
+    connection_peers_.clear();
 
     for (auto& [id, conn] : connections_) {
         (void)id;
@@ -191,6 +193,14 @@ Result<StreamHandle> Swarm::open_stream(ConnectionId conn_id, ProtocolId proto) 
         remove_connection(closed_id);
     }
     return stream;
+}
+
+Result<StreamHandle> Swarm::open_stream(const PeerId& peer, ProtocolId proto) {
+    const auto it = peer_connections_.find(peer.to_string());
+    if (it == peer_connections_.end()) {
+        return Result<StreamHandle>::err("no active connection for peer");
+    }
+    return open_stream(it->second, std::move(proto));
 }
 
 void Swarm::register_handler(std::shared_ptr<ProtocolHandler> handler) {
@@ -371,6 +381,9 @@ void Swarm::handle_connection_event(ConnectionId id,
         case ConnectionEvent::Type::Secured:
             if (auto it = connections_.find(id);
                 it != connections_.end() && it->second->remote_peer().has_value()) {
+                const auto peer_key = it->second->remote_peer()->to_string();
+                peer_connections_[peer_key] = id;
+                connection_peers_[id] = peer_key;
                 dispatch_event(SwarmEvent{
                     .type = SwarmEvent::Type::PeerIdentified,
                     .connection_id = id,
@@ -385,6 +398,9 @@ void Swarm::handle_connection_event(ConnectionId id,
                 std::optional<PeerId> peer_id;
                 if (auto it = connections_.find(id); it != connections_.end()) {
                     peer_id = it->second->remote_peer();
+                    if (peer_id.has_value()) {
+                        peer_store_.record_dial_success(*peer_id);
+                    }
                 }
             dispatch_event(SwarmEvent{
                 .type = SwarmEvent::Type::ConnectionEstablished,
@@ -445,6 +461,10 @@ void Swarm::handle_connection_event(ConnectionId id,
 }
 
 void Swarm::remove_connection(ConnectionId id) {
+    if (auto peer_it = connection_peers_.find(id); peer_it != connection_peers_.end()) {
+        peer_connections_.erase(peer_it->second);
+        connection_peers_.erase(peer_it);
+    }
     auto fd_it = conn_fds_.find(id);
     if (fd_it != conn_fds_.end()) {
         event_loop_->unregister_fd(fd_it->second);
