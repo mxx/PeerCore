@@ -1,11 +1,9 @@
 #include "tcp_transport.hpp"
 
-#include <algorithm>
-#include <array>
-#include <cerrno>
-#include <cstdlib>
-#include <cstring>
 #include <arpa/inet.h>
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <string>
@@ -37,7 +35,10 @@ Result<sockaddr_in> to_sockaddr(const Multiaddr& addr) {
 
 Multiaddr from_sockaddr(const sockaddr_in& addr) {
     char ip[INET_ADDRSTRLEN] = {};
-    ::inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
+    if (::inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip)) == nullptr) {
+        PEERCORE_LOG_ERROR(kComp, "inet_ntop failed: {}", std::strerror(errno));
+        return Multiaddr::from_ip4_tcp("0.0.0.0", ntohs(addr.sin_port));
+    }
     return Multiaddr::from_ip4_tcp(ip, ntohs(addr.sin_port));
 }
 
@@ -74,8 +75,19 @@ TcpTransport::TcpTransport() = default;
 TcpTransport::~TcpTransport() { close_all(); }
 
 Result<void> TcpTransport::listen(const Multiaddr& addr, TcpTransportCallbacks callbacks) {
-    auto socket = create_listen_socket(addr);
-    if (socket.is_err()) return Result<void>::err(socket.error().message);
+    auto socket_addr = to_sockaddr(addr);
+    if (socket_addr.is_err()) {
+        PEERCORE_LOG_WARN(kComp, "listen addr={} parse error: {}", addr.to_string(),
+                          socket_addr.error().message);
+        return Result<void>::err(socket_addr.error().message);
+    }
+
+    auto socket = create_listen_socket(socket_addr.value());
+    if (socket.is_err()) {
+        PEERCORE_LOG_WARN(kComp, "listen addr={} failed: {}", addr.to_string(),
+                          socket.error().message);
+        return Result<void>::err(socket.error().message);
+    }
 
     listeners_.push_back(Listener{
         .fd = socket.value(),
@@ -87,15 +99,13 @@ Result<void> TcpTransport::listen(const Multiaddr& addr, TcpTransportCallbacks c
 }
 
 Result<void> TcpTransport::dial(const Multiaddr& addr, TcpTransportCallbacks callbacks) {
-    auto socket = create_connect_socket(addr);
+    auto socket_addr = to_sockaddr(addr);
+    if (socket_addr.is_err()) return Result<void>::err(socket_addr.error().message);
+
+    auto socket = create_connect_socket();
     if (socket.is_err()) return Result<void>::err(socket.error().message);
 
     RawFd fd = socket.value();
-    auto socket_addr = to_sockaddr(addr);
-    if (socket_addr.is_err()) {
-        close_fd(fd);
-        return Result<void>::err(socket_addr.error().message);
-    }
 
     const int rc = ::connect(fd,
                              reinterpret_cast<const sockaddr*>(&socket_addr.value()),
@@ -112,7 +122,7 @@ Result<void> TcpTransport::dial(const Multiaddr& addr, TcpTransportCallbacks cal
 
     if (errno != EINPROGRESS) {
         const std::string detail = std::strerror(errno);
-        PEERCORE_LOG_DEBUG(kComp, "dial failed immediately addr={} err={}", addr.to_string(), detail);
+        PEERCORE_LOG_WARN(kComp, "dial failed immediately addr={} err={}", addr.to_string(), detail);
         if (callbacks.on_dial_failed) callbacks.on_dial_failed(addr, detail);
         close_fd(fd);
         return Result<void>::ok();
@@ -152,11 +162,10 @@ void TcpTransport::on_accept_ready(RawFd listen_fd) {
             continue;
         }
 
+        const Multiaddr remote = from_sockaddr(addr);
+        PEERCORE_LOG_DEBUG(kComp, "accepted fd={} remote={}", fd, remote.to_string());
         if (it->callbacks.on_accepted) {
-            it->callbacks.on_accepted(TcpSocket{
-                .fd = fd,
-                .remote_addr = from_sockaddr(addr),
-            });
+            it->callbacks.on_accepted(TcpSocket{.fd = fd, .remote_addr = remote});
         } else {
             close_fd(fd);
         }
@@ -181,8 +190,8 @@ void TcpTransport::on_connect_ready(RawFd socket_fd) {
 
     if (so_error != 0) {
         const std::string detail = std::strerror(so_error);
-        PEERCORE_LOG_DEBUG(kComp, "dial failed fd={} addr={} err={}",
-                           socket_fd, dial.addr.to_string(), detail);
+        PEERCORE_LOG_WARN(kComp, "dial failed fd={} addr={} err={}",
+                          socket_fd, dial.addr.to_string(), detail);
         if (dial.callbacks.on_dial_failed) {
             dial.callbacks.on_dial_failed(dial.addr, detail);
         }
@@ -230,6 +239,8 @@ Result<Multiaddr> TcpTransport::local_addr(RawFd fd) const {
 }
 
 void TcpTransport::close_all() {
+    PEERCORE_LOG_DEBUG(kComp, "close_all: {} listener(s) {} pending dial(s)",
+                       listeners_.size(), pending_dials_.size());
     for (auto& listener : listeners_) {
         close_fd(listener.fd);
     }
@@ -241,10 +252,7 @@ void TcpTransport::close_all() {
     pending_dials_.clear();
 }
 
-Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
-    auto socket_addr = to_sockaddr(addr);
-    if (socket_addr.is_err()) return Result<RawFd>::err(socket_addr.error().message);
-
+Result<RawFd> TcpTransport::create_listen_socket(const sockaddr_in& addr) {
     RawFd fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return Result<RawFd>::err(std::string("socket() failed: ") + std::strerror(errno));
@@ -258,7 +266,7 @@ Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
     }
 
     if (::bind(fd,
-               reinterpret_cast<const sockaddr*>(&socket_addr.value()),
+               reinterpret_cast<const sockaddr*>(&addr),
                sizeof(sockaddr_in)) < 0) {
         const std::string detail = std::strerror(errno);
         close_fd(fd);
@@ -273,10 +281,7 @@ Result<RawFd> TcpTransport::create_listen_socket(const Multiaddr& addr) {
     return Result<RawFd>::ok(fd);
 }
 
-Result<RawFd> TcpTransport::create_connect_socket(const Multiaddr& addr) {
-    auto socket_addr = to_sockaddr(addr);
-    if (socket_addr.is_err()) return Result<RawFd>::err(socket_addr.error().message);
-
+Result<RawFd> TcpTransport::create_connect_socket() {
     RawFd fd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) {
         return Result<RawFd>::err(std::string("socket() failed: ") + std::strerror(errno));

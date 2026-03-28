@@ -289,7 +289,7 @@ TEST(TcpTransportAccept, SingleClientFiresCallback) {
     std::optional<TcpSocket> accepted_sock;
 
     const uint16_t port = listen_loopback(t, TcpTransportCallbacks{
-        .on_accepted = [&](TcpSocket s) { accepted_sock = s; ++accept_count; },
+        .on_accepted = [&](TcpSocket s) { accepted_sock = std::move(s); ++accept_count; },
     });
     ASSERT_GT(port, 0u);
 

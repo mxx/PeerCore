@@ -40,6 +40,7 @@ struct Multiaddr {
 
     std::vector<uint8_t> bytes;
 
+    Multiaddr() = default;
     explicit Multiaddr(std::string_view text);
     std::string to_string() const;
 

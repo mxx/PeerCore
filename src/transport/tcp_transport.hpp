@@ -3,6 +3,7 @@
 #include "../../include/peercore/types.hpp"
 
 #include <functional>
+#include <netinet/in.h>
 #include <vector>
 
 namespace peercore::transport {
@@ -18,7 +19,7 @@ struct TcpSocket {
 struct TcpTransportCallbacks {
     std::function<void(TcpSocket)> on_accepted;   // inbound connection
     std::function<void(TcpSocket)> on_connected;  // outbound dial succeeded
-    std::function<void(Multiaddr, std::string)> on_dial_failed;
+    std::function<void(const Multiaddr&, std::string)> on_dial_failed;
 };
 
 class TcpTransport {
@@ -27,6 +28,11 @@ public:
     ~TcpTransport();
 
     Result<void> listen(const Multiaddr& addr, TcpTransportCallbacks callbacks);
+
+    // Initiates a non-blocking outbound connection.
+    // Returns ok if the dial was *initiated* (regardless of connection outcome).
+    // The result is always delivered via callbacks: on_connected or on_dial_failed.
+    // Returns err only if the address is malformed or socket() fails.
     Result<void> dial(const Multiaddr& addr, TcpTransportCallbacks callbacks);
 
     // Called by EventLoop when the listen socket is readable
@@ -38,6 +44,8 @@ public:
     std::vector<RawFd> dialing_fds() const;
     Result<Multiaddr> local_addr(RawFd fd) const;
 
+    // Close and discard all listeners and pending dials.
+    // Safe to call multiple times. Also called by the destructor.
     void close_all();
 
 private:
@@ -56,8 +64,8 @@ private:
     std::vector<Listener> listeners_;
     std::vector<PendingDial> pending_dials_;
 
-    static Result<RawFd> create_listen_socket(const Multiaddr& addr);
-    static Result<RawFd> create_connect_socket(const Multiaddr& addr);
+    static Result<RawFd> create_listen_socket(const sockaddr_in& addr);
+    static Result<RawFd> create_connect_socket();
 };
 
 }  // namespace peercore::transport
