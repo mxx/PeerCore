@@ -1,0 +1,26 @@
+services:
+  go-peer:
+    build:
+      context: ../../
+      dockerfile: tests/interop/go-peer/Dockerfile
+    environment:
+      LISTEN_ADDR: ${LISTEN_ADDR:-/ip4/0.0.0.0/tcp/4001}
+      TARGET_ADDR: ${TARGET_ADDR:-}
+      RUNTIME_MS: ${RUNTIME_MS:-15000}
+    ports:
+      - "41001:4001"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  rust-peer:
+    build:
+      context: ../../
+      dockerfile: tests/interop/rust-peer/Dockerfile
+    environment:
+      LISTEN_ADDR: ${LISTEN_ADDR:-/ip4/0.0.0.0/tcp/4002}
+      TARGET_ADDR: ${TARGET_ADDR:-}
+      RUNTIME_MS: ${RUNTIME_MS:-15000}
+    ports:
+      - "41002:4002"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

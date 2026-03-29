@@ -1,0 +1,10 @@
+[package]
+name = "peercore-interop-rust"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+futures = "*"
+libp2p = { version = "*", features = ["macros", "noise", "tcp", "tokio", "yamux"] }
+serde_json = "*"
+tokio = { version = "*", features = ["macros", "rt-multi-thread", "time"] }
