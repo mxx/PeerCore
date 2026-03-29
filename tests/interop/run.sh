@@ -6,6 +6,7 @@ CASE_NAME="${1:-}"
 ARTIFACT_DIR="$ROOT_DIR/tests/interop/artifacts/${CASE_NAME}"
 PROBE_BIN="$ROOT_DIR/build/tests/interop_peercore_probe"
 COMPOSE_FILE="$ROOT_DIR/tests/interop/docker-compose.yml"
+REPORT_BIN="$ROOT_DIR/tests/interop/report.sh"
 
 if [[ -z "$CASE_NAME" ]]; then
   echo "usage: tests/interop/run.sh <go-outbound|rust-outbound|go-inbound|rust-inbound>" >&2
@@ -17,6 +18,7 @@ if [[ "$CASE_NAME" == "all" ]]; then
   "$0" rust-outbound
   "$0" go-inbound
   "$0" rust-inbound
+  "$REPORT_BIN"
   exit 0
 fi
 

@@ -30,6 +30,8 @@ Current limitation:
   Minimal rust-libp2p peer container.
 - `run.sh`
   Runner for the outbound/inbound diagnostic matrix plus summary generation.
+- `report.sh`
+  Aggregates per-case summaries into a single markdown report.
 
 ## Cases
 
@@ -77,6 +79,7 @@ tests/interop/run.sh all
 
 Artifacts are written under `tests/interop/artifacts/<case>/`.
 Each case also produces a `summary.txt` file with a coarse layer classification.
+Running the full matrix also writes `tests/interop/artifacts/report.md`.
 
 ## Follow-up
 
