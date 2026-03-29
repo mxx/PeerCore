@@ -16,6 +16,9 @@ endfunction()
 add_executable(interop_peercore_probe interop/peercore_probe.cpp)
 target_link_libraries(interop_peercore_probe PRIVATE peercore Libsodium::Libsodium)
 
+add_executable(interop_noise_trace interop/noise_trace.cpp)
+target_link_libraries(interop_noise_trace PRIVATE peercore Libsodium::Libsodium)
+
 add_peercore_test(test_types)
 add_peercore_test(test_peer_store)
 add_peercore_test(test_routing_table)

@@ -22,6 +22,9 @@ Current limitation:
 - `peercore_probe.cpp`
   Local binary that starts a `Swarm`, optionally listens, optionally dials, and
   prints JSON event lines.
+- `noise_trace.cpp`
+  Local binary for deterministic PeerCore Noise XX tracing with fixed initiator
+  secrets, useful alongside the Go oracle.
 - `docker-compose.yml`
   Container definitions for Go and Rust libp2p peers.
 - `go-peer/`
@@ -72,6 +75,12 @@ Build the local probe:
 
 ```bash
 cmake --build build --target interop_peercore_probe
+```
+
+Build the deterministic Noise trace helper:
+
+```bash
+cmake --build build --target interop_noise_trace
 ```
 
 Run one case:

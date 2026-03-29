@@ -36,6 +36,8 @@ struct NoiseSession {
     // Ephemeral keypair for this session
     NoiseKeypair ephemeral;
     NoiseKeypair static_key;
+    std::optional<NoiseKeypair> configured_ephemeral;
+    std::optional<NoiseKeypair> configured_static;
     std::array<uint8_t, 32> remote_ephemeral_pub{};
     bool has_remote_ephemeral{false};
     std::array<uint8_t, 32> remote_static_pub{};

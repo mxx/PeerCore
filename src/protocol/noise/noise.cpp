@@ -404,6 +404,15 @@ Result<void> verify_remote_identity(NoiseSession& session, ConstBytes payload_by
     session.remote_extensions = payload.value().extensions;
     return Result<void>::ok();
 }
+
+NoiseKeypair take_or_generate_keypair(std::optional<NoiseKeypair>& configured) {
+    if (configured.has_value()) {
+        auto keypair = *configured;
+        configured.reset();
+        return keypair;
+    }
+    return NoiseHandshake::generate_keypair();
+}
 }  // namespace
 
 NoiseKeypair NoiseHandshake::generate_keypair() {
@@ -422,8 +431,8 @@ std::vector<uint8_t> NoiseHandshake::write_msg1(NoiseSession& session) {
     session.is_initiator = true;
     auto symmetric = initialize_symmetric(session);
     if (symmetric.is_err()) return {};
-    session.ephemeral = generate_keypair();
-    session.static_key = generate_keypair();
+    session.ephemeral = take_or_generate_keypair(session.configured_ephemeral);
+    session.static_key = take_or_generate_keypair(session.configured_static);
 
     std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
                              session.ephemeral.public_key.end());
@@ -449,8 +458,8 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
     session.has_remote_ephemeral = true;
     mix_hash(session, msg1);
 
-    session.ephemeral = generate_keypair();
-    session.static_key = generate_keypair();
+    session.ephemeral = take_or_generate_keypair(session.configured_ephemeral);
+    session.static_key = take_or_generate_keypair(session.configured_static);
 
     std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
                              session.ephemeral.public_key.end());
