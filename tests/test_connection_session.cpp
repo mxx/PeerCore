@@ -557,7 +557,7 @@ TEST(ConnectionSession, ClosesWhenPeerSendsTamperedNoiseMsg2) {
     auto events = drain_events(*outbound);
     ASSERT_GE(events.size(), 2u);
     EXPECT_EQ(events[0].type, ConnectionEvent::Type::Error);
-    EXPECT_EQ(events[0].detail, "noise::decrypt failed");
+    EXPECT_NE(events[0].detail.find("noise::decrypt failed"), std::string::npos);
     EXPECT_EQ(events[1].type, ConnectionEvent::Type::Closed);
 
     sockets.local = -1;

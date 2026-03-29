@@ -501,7 +501,8 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg2(NoiseSession& session,
     ConstBytes encrypted_static(msg2.data() + 32, kEncryptedStaticLen);
     auto remote_static = decrypt_and_hash(session, encrypted_static);
     if (remote_static.is_err()) {
-        return Result<std::vector<uint8_t>>::err(remote_static.error().message);
+        return Result<std::vector<uint8_t>>::err("noise msg2 static decrypt failed: " +
+                                                 remote_static.error().message);
     }
     if (remote_static.value().size() != 32) {
         return Result<std::vector<uint8_t>>::err("invalid noise static key");
@@ -516,7 +517,8 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg2(NoiseSession& session,
                                  msg2.size() - 32 - kEncryptedStaticLen);
     auto remote_payload = decrypt_and_hash(session, encrypted_payload);
     if (remote_payload.is_err()) {
-        return Result<std::vector<uint8_t>>::err(remote_payload.error().message);
+        return Result<std::vector<uint8_t>>::err("noise msg2 payload decrypt failed: " +
+                                                 remote_payload.error().message);
     }
     auto verified = verify_remote_identity(session, remote_payload.value());
     if (verified.is_err()) {
@@ -565,7 +567,10 @@ Result<void> NoiseHandshake::process_msg3(NoiseSession& session, ConstBytes msg3
 
     ConstBytes encrypted_static(msg3.data(), kEncryptedStaticLen);
     auto remote_static = decrypt_and_hash(session, encrypted_static);
-    if (remote_static.is_err()) return Result<void>::err(remote_static.error().message);
+    if (remote_static.is_err()) {
+        return Result<void>::err("noise msg3 static decrypt failed: " +
+                                 remote_static.error().message);
+    }
     if (remote_static.value().size() != 32) {
         return Result<void>::err("invalid noise static key");
     }
@@ -578,7 +583,10 @@ Result<void> NoiseHandshake::process_msg3(NoiseSession& session, ConstBytes msg3
     ConstBytes encrypted_payload(msg3.data() + kEncryptedStaticLen,
                                  msg3.size() - kEncryptedStaticLen);
     auto remote_payload = decrypt_and_hash(session, encrypted_payload);
-    if (remote_payload.is_err()) return Result<void>::err(remote_payload.error().message);
+    if (remote_payload.is_err()) {
+        return Result<void>::err("noise msg3 payload decrypt failed: " +
+                                 remote_payload.error().message);
+    }
 
     auto verified = verify_remote_identity(session, remote_payload.value());
     if (verified.is_err()) return verified;

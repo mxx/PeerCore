@@ -174,7 +174,7 @@ TEST(NoiseHandshake, RejectsTamperedHandshakeCiphertexts) {
     tampered_msg2.back() ^= 0x01;
     auto bad_msg2 = NoiseHandshake::process_msg2(initiator, tampered_msg2);
     ASSERT_TRUE(bad_msg2.is_err());
-    EXPECT_EQ(bad_msg2.error().message, "noise::decrypt failed");
+    EXPECT_NE(bad_msg2.error().message.find("noise::decrypt failed"), std::string::npos);
     EXPECT_FALSE(initiator.handshake_complete);
 
     NoiseSession clean_initiator;
@@ -190,7 +190,7 @@ TEST(NoiseHandshake, RejectsTamperedHandshakeCiphertexts) {
     tampered_msg3.back() ^= 0x01;
     auto bad_msg3 = NoiseHandshake::process_msg3(clean_responder, tampered_msg3);
     ASSERT_TRUE(bad_msg3.is_err());
-    EXPECT_EQ(bad_msg3.error_message(), "noise::decrypt failed");
+    EXPECT_NE(bad_msg3.error_message().find("noise::decrypt failed"), std::string::npos);
     EXPECT_FALSE(clean_responder.handshake_complete);
 }
 
