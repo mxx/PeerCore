@@ -161,6 +161,7 @@ Result<void> initialize_symmetric(NoiseSession& session) {
     }
 
     session.chaining_key = session.handshake_hash;
+    mix_hash(session, ConstBytes{});
     return Result<void>::ok();
 }
 
