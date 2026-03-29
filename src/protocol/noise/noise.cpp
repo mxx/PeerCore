@@ -3,9 +3,9 @@
 #include <sodium.h>
 
 #include <algorithm>
-#include <cstring>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 namespace peercore::protocol::noise {
 
@@ -66,18 +66,10 @@ Result<void> ensure_sodium_ready() {
     return Result<void>::ok();
 }
 
-Result<std::array<uint8_t, 32>> derive_key(ConstBytes secret_material,
-                                           std::string_view label) {
-    crypto_hash_sha256_state state;
-    crypto_hash_sha256_init(&state);
-    crypto_hash_sha256_update(&state, secret_material.data(), secret_material.size());
-    crypto_hash_sha256_update(&state,
-                              reinterpret_cast<const unsigned char*>(label.data()),
-                              label.size());
-
-    std::array<uint8_t, 32> key{};
-    crypto_hash_sha256_final(&state, key.data());
-    return Result<std::array<uint8_t, 32>>::ok(key);
+std::array<uint8_t, 32> hash_sha256(ConstBytes bytes) {
+    std::array<uint8_t, 32> out{};
+    crypto_hash_sha256(out.data(), bytes.data(), bytes.size());
+    return out;
 }
 
 Result<std::array<uint8_t, 32>> compute_shared_secret(const NoiseKeypair& local,
@@ -91,82 +83,104 @@ Result<std::array<uint8_t, 32>> compute_shared_secret(const NoiseKeypair& local,
     return Result<std::array<uint8_t, 32>>::ok(shared);
 }
 
-std::vector<uint8_t> combine_secrets(std::initializer_list<ConstBytes> parts) {
-    std::vector<uint8_t> out;
-    size_t total = 0;
-    for (const auto part : parts) total += part.size();
-    out.reserve(total);
-    for (const auto part : parts) {
-        out.insert(out.end(), part.begin(), part.end());
-    }
-    return out;
-}
-
-Result<void> derive_transport_keys(NoiseSession& session) {
-    if (!session.has_handshake_ee || !session.has_handshake_es) {
-        return Result<void>::err("missing handshake key material");
-    }
-
-    auto se = session.is_initiator
-                  ? compute_shared_secret(session.static_key, session.remote_ephemeral_pub)
-                  : compute_shared_secret(session.ephemeral, session.remote_static_pub);
-    if (se.is_err()) return Result<void>::err(se.error().message);
-
-    auto secret_material = combine_secrets(
-        {session.handshake_ee, session.handshake_es, se.value()});
-
-    const std::string_view send_label = session.is_initiator ? "init->resp" : "resp->init";
-    const std::string_view recv_label = session.is_initiator ? "resp->init" : "init->resp";
-
-    auto send_key = derive_key(secret_material, send_label);
-    if (send_key.is_err()) return Result<void>::err(send_key.error().message);
-    auto recv_key = derive_key(secret_material, recv_label);
-    if (recv_key.is_err()) return Result<void>::err(recv_key.error().message);
-
-    session.cs_send.key = send_key.value();
-    session.cs_send.nonce = 0;
-    session.cs_recv.key = recv_key.value();
-    session.cs_recv.nonce = 0;
-    return Result<void>::ok();
-}
-
 std::array<unsigned char, crypto_aead_chacha20poly1305_ietf_NPUBBYTES>
 make_nonce(uint64_t nonce) {
     std::array<unsigned char, crypto_aead_chacha20poly1305_ietf_NPUBBYTES> out{};
-    std::memcpy(out.data(), &nonce, sizeof(nonce));
+    for (size_t index = 0; index < sizeof(nonce); ++index) {
+        out[4 + index] = static_cast<unsigned char>((nonce >> (index * 8)) & 0xFF);
+    }
     return out;
 }
 
-Result<std::array<uint8_t, 32>> derive_msg2_key(const NoiseSession& session) {
-    if (!session.has_handshake_ee) {
-        return Result<std::array<uint8_t, 32>>::err("missing ee handshake secret");
+Result<std::array<uint8_t, 32>> hmac_sha256(ConstBytes key, ConstBytes data) {
+    crypto_auth_hmacsha256_state state;
+    if (::crypto_auth_hmacsha256_init(&state, key.data(), key.size()) != 0) {
+        return Result<std::array<uint8_t, 32>>::err("hmac init failed");
     }
-    return derive_key(session.handshake_ee, "msg2");
+    ::crypto_auth_hmacsha256_update(&state, data.data(), data.size());
+    std::array<uint8_t, 32> out{};
+    ::crypto_auth_hmacsha256_final(&state, out.data());
+    return Result<std::array<uint8_t, 32>>::ok(out);
 }
 
-Result<std::array<uint8_t, 32>> derive_msg3_key(const NoiseSession& session) {
-    if (!session.has_handshake_ee || !session.has_handshake_es) {
-        return Result<std::array<uint8_t, 32>>::err("missing msg3 handshake secret");
+Result<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 32>>> hkdf2(
+    std::span<const uint8_t, 32> chaining_key,
+    ConstBytes input_material) {
+    auto temp_key = hmac_sha256(chaining_key, input_material);
+    if (temp_key.is_err()) {
+        return Result<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 32>>>::err(
+            temp_key.error().message);
     }
-    const auto material = combine_secrets({session.handshake_ee, session.handshake_es});
-    return derive_key(material, "msg3");
+
+    const std::array<uint8_t, 1> marker1{0x01};
+    auto out1 = hmac_sha256(temp_key.value(), marker1);
+    if (out1.is_err()) {
+        return Result<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 32>>>::err(
+            out1.error().message);
+    }
+
+    std::array<uint8_t, 33> marker2{};
+    std::copy(out1.value().begin(), out1.value().end(), marker2.begin());
+    marker2.back() = 0x02;
+    auto out2 = hmac_sha256(temp_key.value(), marker2);
+    if (out2.is_err()) {
+        return Result<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 32>>>::err(
+            out2.error().message);
+    }
+
+    return Result<std::pair<std::array<uint8_t, 32>, std::array<uint8_t, 32>>>::ok(
+        {out1.value(), out2.value()});
+}
+
+void mix_hash(NoiseSession& session, ConstBytes data) {
+    crypto_hash_sha256_state state;
+    crypto_hash_sha256_init(&state);
+    crypto_hash_sha256_update(&state, session.handshake_hash.data(), session.handshake_hash.size());
+    crypto_hash_sha256_update(&state, data.data(), data.size());
+    crypto_hash_sha256_final(&state, session.handshake_hash.data());
+}
+
+Result<void> initialize_symmetric(NoiseSession& session) {
+    constexpr std::string_view kProtocolName = "Noise_XX_25519_ChaChaPoly_SHA256";
+
+    session.remote_peer_id.reset();
+    session.remote_extensions = {};
+    session.handshake_complete = false;
+    session.has_remote_ephemeral = false;
+    session.has_remote_static = false;
+    session.handshake_cipher = {};
+    session.cs_send = {};
+    session.cs_recv = {};
+
+    session.handshake_hash.fill(0);
+    if (kProtocolName.size() <= session.handshake_hash.size()) {
+        std::copy(kProtocolName.begin(), kProtocolName.end(), session.handshake_hash.begin());
+    } else {
+        session.handshake_hash = hash_sha256(ConstBytes(
+            reinterpret_cast<const uint8_t*>(kProtocolName.data()), kProtocolName.size()));
+    }
+
+    session.chaining_key = session.handshake_hash;
+    return Result<void>::ok();
 }
 
 Result<std::vector<uint8_t>> encrypt_with_key(std::span<const uint8_t, 32> key,
-                                              ConstBytes plaintext) {
+                                              uint64_t nonce,
+                                              ConstBytes plaintext,
+                                              ConstBytes ad) {
     std::vector<uint8_t> ciphertext(
         plaintext.size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
     unsigned long long out_len = 0;
-    const auto nonce = make_nonce(0);
+    const auto encoded_nonce = make_nonce(nonce);
 
     if (::crypto_aead_chacha20poly1305_ietf_encrypt(ciphertext.data(),
                                                     &out_len,
                                                     plaintext.data(),
                                                     plaintext.size(),
+                                                    ad.data(),
+                                                    ad.size(),
                                                     nullptr,
-                                                    0,
-                                                    nullptr,
-                                                    nonce.data(),
+                                                    encoded_nonce.data(),
                                                     key.data()) != 0) {
         return Result<std::vector<uint8_t>>::err("noise::encrypt failed");
     }
@@ -176,7 +190,9 @@ Result<std::vector<uint8_t>> encrypt_with_key(std::span<const uint8_t, 32> key,
 }
 
 Result<std::vector<uint8_t>> decrypt_with_key(std::span<const uint8_t, 32> key,
-                                              ConstBytes ciphertext) {
+                                              uint64_t nonce,
+                                              ConstBytes ciphertext,
+                                              ConstBytes ad) {
     if (ciphertext.size() < crypto_aead_chacha20poly1305_ietf_ABYTES) {
         return Result<std::vector<uint8_t>>::err("ciphertext too short");
     }
@@ -184,22 +200,92 @@ Result<std::vector<uint8_t>> decrypt_with_key(std::span<const uint8_t, 32> key,
     std::vector<uint8_t> plaintext(
         ciphertext.size() - crypto_aead_chacha20poly1305_ietf_ABYTES);
     unsigned long long out_len = 0;
-    const auto nonce = make_nonce(0);
+    const auto encoded_nonce = make_nonce(nonce);
 
     if (::crypto_aead_chacha20poly1305_ietf_decrypt(plaintext.data(),
                                                     &out_len,
                                                     nullptr,
                                                     ciphertext.data(),
                                                     ciphertext.size(),
-                                                    nullptr,
-                                                    0,
-                                                    nonce.data(),
+                                                    ad.data(),
+                                                    ad.size(),
+                                                    encoded_nonce.data(),
                                                     key.data()) != 0) {
         return Result<std::vector<uint8_t>>::err("noise::decrypt failed");
     }
 
     plaintext.resize(out_len);
     return Result<std::vector<uint8_t>>::ok(std::move(plaintext));
+}
+
+Result<void> mix_key(NoiseSession& session, ConstBytes input_material) {
+    auto derived = hkdf2(session.chaining_key, input_material);
+    if (derived.is_err()) return Result<void>::err(derived.error().message);
+
+    session.chaining_key = derived.value().first;
+    session.handshake_cipher.key = derived.value().second;
+    session.handshake_cipher.nonce = 0;
+    session.handshake_cipher.has_key = true;
+    return Result<void>::ok();
+}
+
+Result<void> mix_key_dh(NoiseSession& session,
+                        const NoiseKeypair& local,
+                        std::span<const uint8_t, 32> remote_pub) {
+    auto shared = compute_shared_secret(local, remote_pub);
+    if (shared.is_err()) return Result<void>::err(shared.error().message);
+    return mix_key(session, shared.value());
+}
+
+Result<std::vector<uint8_t>> encrypt_and_hash(NoiseSession& session, ConstBytes plaintext) {
+    if (!session.handshake_cipher.has_key) {
+        std::vector<uint8_t> out(plaintext.begin(), plaintext.end());
+        mix_hash(session, out);
+        return Result<std::vector<uint8_t>>::ok(std::move(out));
+    }
+
+    auto ciphertext = encrypt_with_key(session.handshake_cipher.key,
+                                       session.handshake_cipher.nonce,
+                                       plaintext,
+                                       session.handshake_hash);
+    if (ciphertext.is_err()) return ciphertext;
+
+    ++session.handshake_cipher.nonce;
+    mix_hash(session, ciphertext.value());
+    return ciphertext;
+}
+
+Result<std::vector<uint8_t>> decrypt_and_hash(NoiseSession& session, ConstBytes ciphertext) {
+    if (!session.handshake_cipher.has_key) {
+        std::vector<uint8_t> out(ciphertext.begin(), ciphertext.end());
+        mix_hash(session, ciphertext);
+        return Result<std::vector<uint8_t>>::ok(std::move(out));
+    }
+
+    auto plaintext = decrypt_with_key(session.handshake_cipher.key,
+                                      session.handshake_cipher.nonce,
+                                      ciphertext,
+                                      session.handshake_hash);
+    if (plaintext.is_err()) return plaintext;
+
+    ++session.handshake_cipher.nonce;
+    mix_hash(session, ciphertext);
+    return plaintext;
+}
+
+Result<void> split_transport(NoiseSession& session) {
+    auto derived = hkdf2(session.chaining_key, ConstBytes{});
+    if (derived.is_err()) return Result<void>::err(derived.error().message);
+
+    if (session.is_initiator) {
+        session.cs_send = CipherState{.key = derived.value().first, .nonce = 0, .has_key = true};
+        session.cs_recv =
+            CipherState{.key = derived.value().second, .nonce = 0, .has_key = true};
+    } else {
+        session.cs_send = CipherState{.key = derived.value().second, .nonce = 0, .has_key = true};
+        session.cs_recv = CipherState{.key = derived.value().first, .nonce = 0, .has_key = true};
+    }
+    return Result<void>::ok();
 }
 
 std::vector<uint8_t> serialize_public_key_ed25519(std::span<const uint8_t, 32> public_key) {
@@ -268,7 +354,7 @@ Result<NoiseExtensions> parse_extensions(ConstBytes bytes) {
         if (key.is_err()) return Result<NoiseExtensions>::err(key.error().message);
         const uint32_t field_no = static_cast<uint32_t>(key.value() >> 3);
         const uint32_t wire_type = static_cast<uint32_t>(key.value() & 0x07);
-        if (field_no != 2 || wire_type != 2) {
+        if (wire_type != 2) {
             return Result<NoiseExtensions>::err("unsupported noise extension");
         }
 
@@ -277,8 +363,11 @@ Result<NoiseExtensions> parse_extensions(ConstBytes bytes) {
         if (bytes.size() < len.value()) {
             return Result<NoiseExtensions>::err("invalid noise extension");
         }
-        extensions.stream_muxers.emplace_back(reinterpret_cast<const char*>(bytes.data()),
-                                              reinterpret_cast<const char*>(bytes.data() + len.value()));
+        if (field_no == 2) {
+            extensions.stream_muxers.emplace_back(
+                reinterpret_cast<const char*>(bytes.data()),
+                reinterpret_cast<const char*>(bytes.data() + len.value()));
+        }
         bytes = bytes.subspan(len.value());
     }
     return Result<NoiseExtensions>::ok(std::move(extensions));
@@ -291,41 +380,6 @@ Result<std::vector<uint8_t>> make_local_payload(const NoiseSession& session) {
     return NoiseHandshake::make_handshake_payload(*session.local_identity,
                                                   session.static_key,
                                                   session.local_extensions);
-}
-
-Result<std::vector<uint8_t>> serialize_static_payload_message(const NoiseSession& session) {
-    auto payload = make_local_payload(session);
-    if (payload.is_err()) return payload;
-
-    std::vector<uint8_t> out;
-    out.reserve(34 + payload.value().size());
-    out.insert(out.end(),
-               session.static_key.public_key.begin(),
-               session.static_key.public_key.end());
-    const uint16_t payload_len = static_cast<uint16_t>(payload.value().size());
-    out.push_back(static_cast<uint8_t>((payload_len >> 8) & 0xFF));
-    out.push_back(static_cast<uint8_t>(payload_len & 0xFF));
-    out.insert(out.end(), payload.value().begin(), payload.value().end());
-    return Result<std::vector<uint8_t>>::ok(std::move(out));
-}
-
-Result<void> parse_static_payload_message(NoiseSession& session,
-                                     ConstBytes msg,
-                                     std::vector<uint8_t>& payload) {
-    if (msg.size() < 34) {
-        return Result<void>::err("invalid noise static payload");
-    }
-
-    std::copy_n(msg.begin(), 32, session.remote_static_pub.begin());
-
-    const uint16_t payload_len = static_cast<uint16_t>(
-        (static_cast<uint16_t>(msg[32]) << 8) | msg[33]);
-    if (msg.size() != static_cast<size_t>(payload_len) + 34) {
-        return Result<void>::err("invalid noise static payload");
-    }
-
-    payload.assign(msg.begin() + 34, msg.end());
-    return Result<void>::ok();
 }
 
 Result<void> verify_remote_identity(NoiseSession& session, ConstBytes payload_bytes) {
@@ -364,10 +418,15 @@ std::vector<uint8_t> NoiseHandshake::write_msg1(NoiseSession& session) {
     if (sodium_ready.is_err()) return {};
 
     session.is_initiator = true;
+    auto symmetric = initialize_symmetric(session);
+    if (symmetric.is_err()) return {};
     session.ephemeral = generate_keypair();
     session.static_key = generate_keypair();
-    return std::vector<uint8_t>(session.ephemeral.public_key.begin(),
-                                session.ephemeral.public_key.end());
+
+    std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
+                             session.ephemeral.public_key.end());
+    mix_hash(session, out);
+    return out;
 }
 
 Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
@@ -380,38 +439,43 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
         return Result<std::vector<uint8_t>>::err("invalid msg1 size");
     }
     session.is_initiator = false;
+    auto symmetric = initialize_symmetric(session);
+    if (symmetric.is_err()) {
+        return Result<std::vector<uint8_t>>::err(symmetric.error_message());
+    }
     std::copy_n(msg1.begin(), 32, session.remote_ephemeral_pub.begin());
     session.has_remote_ephemeral = true;
+    mix_hash(session, msg1);
 
     session.ephemeral = generate_keypair();
     session.static_key = generate_keypair();
 
-    auto ee = compute_shared_secret(session.ephemeral, session.remote_ephemeral_pub);
-    if (ee.is_err()) return Result<std::vector<uint8_t>>::err(ee.error().message);
-    session.handshake_ee = ee.value();
-    session.has_handshake_ee = true;
-
-    auto es = compute_shared_secret(session.static_key, session.remote_ephemeral_pub);
-    if (es.is_err()) return Result<std::vector<uint8_t>>::err(es.error().message);
-    session.handshake_es = es.value();
-    session.has_handshake_es = true;
-
-    auto plaintext = serialize_static_payload_message(session);
-    if (plaintext.is_err()) {
-        return Result<std::vector<uint8_t>>::err(plaintext.error().message);
-    }
-    auto msg2_key = derive_msg2_key(session);
-    if (msg2_key.is_err()) {
-        return Result<std::vector<uint8_t>>::err(msg2_key.error().message);
-    }
-    auto ciphertext = encrypt_with_key(msg2_key.value(), plaintext.value());
-    if (ciphertext.is_err()) {
-        return Result<std::vector<uint8_t>>::err(ciphertext.error().message);
-    }
-
     std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
                              session.ephemeral.public_key.end());
-    out.insert(out.end(), ciphertext.value().begin(), ciphertext.value().end());
+    mix_hash(session, out);
+
+    auto ee = mix_key_dh(session, session.ephemeral, session.remote_ephemeral_pub);
+    if (ee.is_err()) return Result<std::vector<uint8_t>>::err(ee.error_message());
+
+    auto encrypted_static = encrypt_and_hash(session, session.static_key.public_key);
+    if (encrypted_static.is_err()) {
+        return Result<std::vector<uint8_t>>::err(encrypted_static.error().message);
+    }
+    out.insert(out.end(), encrypted_static.value().begin(), encrypted_static.value().end());
+
+    auto es = mix_key_dh(session, session.static_key, session.remote_ephemeral_pub);
+    if (es.is_err()) return Result<std::vector<uint8_t>>::err(es.error_message());
+
+    auto payload = make_local_payload(session);
+    if (payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err(payload.error().message);
+    }
+    auto encrypted_payload = encrypt_and_hash(session, payload.value());
+    if (encrypted_payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err(encrypted_payload.error().message);
+    }
+    out.insert(out.end(), encrypted_payload.value().begin(), encrypted_payload.value().end());
+
     return Result<std::vector<uint8_t>>::ok(std::move(out));
 }
 
@@ -421,76 +485,104 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg2(NoiseSession& session,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
-    if (msg2.size() < 32) {
+    constexpr size_t kEncryptedStaticLen = 32 + crypto_aead_chacha20poly1305_ietf_ABYTES;
+
+    if (msg2.size() < 32 + kEncryptedStaticLen) {
         return Result<std::vector<uint8_t>>::err("invalid msg2 size");
     }
     std::copy_n(msg2.begin(), 32, session.remote_ephemeral_pub.begin());
     session.has_remote_ephemeral = true;
+    mix_hash(session, msg2.subspan(0, 32));
 
-    auto ee = compute_shared_secret(session.ephemeral, session.remote_ephemeral_pub);
-    if (ee.is_err()) return Result<std::vector<uint8_t>>::err(ee.error().message);
-    session.handshake_ee = ee.value();
-    session.has_handshake_ee = true;
+    auto ee = mix_key_dh(session, session.ephemeral, session.remote_ephemeral_pub);
+    if (ee.is_err()) return Result<std::vector<uint8_t>>::err(ee.error_message());
 
-    ConstBytes ciphertext(msg2.data() + 32, msg2.size() - 32);
-    auto msg2_key = derive_msg2_key(session);
-    if (msg2_key.is_err()) {
-        return Result<std::vector<uint8_t>>::err(msg2_key.error().message);
+    ConstBytes encrypted_static(msg2.data() + 32, kEncryptedStaticLen);
+    auto remote_static = decrypt_and_hash(session, encrypted_static);
+    if (remote_static.is_err()) {
+        return Result<std::vector<uint8_t>>::err(remote_static.error().message);
     }
-    auto plaintext = decrypt_with_key(msg2_key.value(), ciphertext);
-    if (plaintext.is_err()) {
-        return Result<std::vector<uint8_t>>::err(plaintext.error().message);
+    if (remote_static.value().size() != 32) {
+        return Result<std::vector<uint8_t>>::err("invalid noise static key");
     }
+    std::copy_n(remote_static.value().begin(), 32, session.remote_static_pub.begin());
+    session.has_remote_static = true;
 
-    std::vector<uint8_t> remote_payload;
-    auto parsed = parse_static_payload_message(session, plaintext.value(), remote_payload);
-    if (parsed.is_err()) {
-        return Result<std::vector<uint8_t>>::err(parsed.error_message());
+    auto es = mix_key_dh(session, session.ephemeral, session.remote_static_pub);
+    if (es.is_err()) return Result<std::vector<uint8_t>>::err(es.error_message());
+
+    ConstBytes encrypted_payload(msg2.data() + 32 + kEncryptedStaticLen,
+                                 msg2.size() - 32 - kEncryptedStaticLen);
+    auto remote_payload = decrypt_and_hash(session, encrypted_payload);
+    if (remote_payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err(remote_payload.error().message);
     }
-    auto verified = verify_remote_identity(session, remote_payload);
+    auto verified = verify_remote_identity(session, remote_payload.value());
     if (verified.is_err()) {
         return Result<std::vector<uint8_t>>::err(verified.error_message());
     }
 
-    auto es = compute_shared_secret(session.ephemeral, session.remote_static_pub);
-    if (es.is_err()) return Result<std::vector<uint8_t>>::err(es.error().message);
-    session.handshake_es = es.value();
-    session.has_handshake_es = true;
+    std::vector<uint8_t> response;
 
-    auto response_plaintext = serialize_static_payload_message(session);
-    if (response_plaintext.is_err()) {
-        return Result<std::vector<uint8_t>>::err(response_plaintext.error().message);
+    auto encrypted_local_static = encrypt_and_hash(session, session.static_key.public_key);
+    if (encrypted_local_static.is_err()) {
+        return Result<std::vector<uint8_t>>::err(encrypted_local_static.error().message);
     }
-    auto msg3_key = derive_msg3_key(session);
-    if (msg3_key.is_err()) {
-        return Result<std::vector<uint8_t>>::err(msg3_key.error().message);
-    }
-    auto response = encrypt_with_key(msg3_key.value(), response_plaintext.value());
-    if (response.is_err()) {
-        return Result<std::vector<uint8_t>>::err(response.error().message);
-    }
+    response.insert(response.end(),
+                    encrypted_local_static.value().begin(),
+                    encrypted_local_static.value().end());
 
-    auto transport = derive_transport_keys(session);
+    auto se = mix_key_dh(session, session.static_key, session.remote_ephemeral_pub);
+    if (se.is_err()) return Result<std::vector<uint8_t>>::err(se.error_message());
+
+    auto local_payload = make_local_payload(session);
+    if (local_payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err(local_payload.error().message);
+    }
+    auto encrypted_local_payload = encrypt_and_hash(session, local_payload.value());
+    if (encrypted_local_payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err(encrypted_local_payload.error().message);
+    }
+    response.insert(response.end(),
+                    encrypted_local_payload.value().begin(),
+                    encrypted_local_payload.value().end());
+
+    auto transport = split_transport(session);
     if (transport.is_err()) {
         return Result<std::vector<uint8_t>>::err(transport.error_message());
     }
     session.handshake_complete = true;
-    return response;
+    return Result<std::vector<uint8_t>>::ok(std::move(response));
 }
 
 Result<void> NoiseHandshake::process_msg3(NoiseSession& session, ConstBytes msg3) {
-    auto msg3_key = derive_msg3_key(session);
-    if (msg3_key.is_err()) return Result<void>::err(msg3_key.error().message);
-    auto plaintext = decrypt_with_key(msg3_key.value(), msg3);
-    if (plaintext.is_err()) return Result<void>::err(plaintext.error().message);
+    constexpr size_t kEncryptedStaticLen = 32 + crypto_aead_chacha20poly1305_ietf_ABYTES;
 
-    std::vector<uint8_t> remote_payload;
-    auto parsed = parse_static_payload_message(session, plaintext.value(), remote_payload);
-    if (parsed.is_err()) return Result<void>::err(parsed.error_message());
-    auto verified = verify_remote_identity(session, remote_payload);
+    if (msg3.size() < kEncryptedStaticLen) {
+        return Result<void>::err("invalid msg3 size");
+    }
+
+    ConstBytes encrypted_static(msg3.data(), kEncryptedStaticLen);
+    auto remote_static = decrypt_and_hash(session, encrypted_static);
+    if (remote_static.is_err()) return Result<void>::err(remote_static.error().message);
+    if (remote_static.value().size() != 32) {
+        return Result<void>::err("invalid noise static key");
+    }
+    std::copy_n(remote_static.value().begin(), 32, session.remote_static_pub.begin());
+    session.has_remote_static = true;
+
+    auto se = mix_key_dh(session, session.ephemeral, session.remote_static_pub);
+    if (se.is_err()) return Result<void>::err(se.error_message());
+
+    ConstBytes encrypted_payload(msg3.data() + kEncryptedStaticLen,
+                                 msg3.size() - kEncryptedStaticLen);
+    auto remote_payload = decrypt_and_hash(session, encrypted_payload);
+    if (remote_payload.is_err()) return Result<void>::err(remote_payload.error().message);
+
+    auto verified = verify_remote_identity(session, remote_payload.value());
     if (verified.is_err()) return verified;
 
-    auto transport = derive_transport_keys(session);
+    auto transport = split_transport(session);
     if (transport.is_err()) return transport;
     session.handshake_complete = true;
     return Result<void>::ok();
@@ -502,27 +594,15 @@ Result<std::vector<uint8_t>> NoiseHandshake::encrypt(CipherState& cs,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
-
-    std::vector<uint8_t> ciphertext(
-        plaintext.size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
-    unsigned long long out_len = 0;
-    const auto nonce = make_nonce(cs.nonce);
-
-    if (::crypto_aead_chacha20poly1305_ietf_encrypt(ciphertext.data(),
-                                                    &out_len,
-                                                    plaintext.data(),
-                                                    plaintext.size(),
-                                                    nullptr,
-                                                    0,
-                                                    nullptr,
-                                                    nonce.data(),
-                                                    cs.key.data()) != 0) {
-        return Result<std::vector<uint8_t>>::err("noise::encrypt failed");
+    if (!cs.has_key) {
+        return Result<std::vector<uint8_t>>::err("noise cipher state is not initialized");
     }
 
-    ciphertext.resize(out_len);
+    auto ciphertext = encrypt_with_key(cs.key, cs.nonce, plaintext, ConstBytes{});
+    if (ciphertext.is_err()) return ciphertext;
+
     ++cs.nonce;
-    return Result<std::vector<uint8_t>>::ok(std::move(ciphertext));
+    return ciphertext;
 }
 
 Result<std::vector<uint8_t>> NoiseHandshake::decrypt(CipherState& cs,
@@ -531,30 +611,15 @@ Result<std::vector<uint8_t>> NoiseHandshake::decrypt(CipherState& cs,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
-    if (ciphertext.size() < crypto_aead_chacha20poly1305_ietf_ABYTES) {
-        return Result<std::vector<uint8_t>>::err("ciphertext too short");
+    if (!cs.has_key) {
+        return Result<std::vector<uint8_t>>::err("noise cipher state is not initialized");
     }
 
-    std::vector<uint8_t> plaintext(
-        ciphertext.size() - crypto_aead_chacha20poly1305_ietf_ABYTES);
-    unsigned long long out_len = 0;
-    const auto nonce = make_nonce(cs.nonce);
+    auto plaintext = decrypt_with_key(cs.key, cs.nonce, ciphertext, ConstBytes{});
+    if (plaintext.is_err()) return plaintext;
 
-    if (::crypto_aead_chacha20poly1305_ietf_decrypt(plaintext.data(),
-                                                    &out_len,
-                                                    nullptr,
-                                                    ciphertext.data(),
-                                                    ciphertext.size(),
-                                                    nullptr,
-                                                    0,
-                                                    nonce.data(),
-                                                    cs.key.data()) != 0) {
-        return Result<std::vector<uint8_t>>::err("noise::decrypt failed");
-    }
-
-    plaintext.resize(out_len);
     ++cs.nonce;
-    return Result<std::vector<uint8_t>>::ok(std::move(plaintext));
+    return plaintext;
 }
 
 Result<std::vector<uint8_t>> NoiseHandshake::make_handshake_payload(
@@ -630,7 +695,7 @@ Result<NoiseHandshakePayload> NoiseHandshake::parse_handshake_payload(ConstBytes
                 break;
             }
             default:
-                return Result<NoiseHandshakePayload>::err("unsupported noise handshake payload field");
+                break;
         }
     }
 

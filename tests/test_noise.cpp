@@ -80,7 +80,7 @@ TEST(NoiseHandshake, RejectsBadMessages) {
 
     auto done = NoiseHandshake::process_msg3(session, std::vector<uint8_t>{0x02});
     ASSERT_TRUE(done.is_err());
-    EXPECT_EQ(done.error_message(), "missing msg3 handshake secret");
+    EXPECT_EQ(done.error_message(), "invalid msg3 size");
 
     NoiseSession initiator;
     NoiseSession responder;
@@ -90,7 +90,7 @@ TEST(NoiseHandshake, RejectsBadMessages) {
 
     auto short_msg3 = NoiseHandshake::process_msg3(responder, std::vector<uint8_t>{0x02});
     ASSERT_TRUE(short_msg3.is_err());
-    EXPECT_EQ(short_msg3.error_message(), "ciphertext too short");
+    EXPECT_EQ(short_msg3.error_message(), "invalid msg3 size");
 }
 
 TEST(NoiseHandshake, ExchangesAndVerifiesRemotePeerIdentity) {
@@ -177,15 +177,21 @@ TEST(NoiseHandshake, RejectsTamperedHandshakeCiphertexts) {
     EXPECT_EQ(bad_msg2.error().message, "noise::decrypt failed");
     EXPECT_FALSE(initiator.handshake_complete);
 
-    auto msg3 = NoiseHandshake::process_msg2(initiator, msg2.value());
+    NoiseSession clean_initiator;
+    NoiseSession clean_responder;
+    auto clean_msg1 = NoiseHandshake::write_msg1(clean_initiator);
+    auto clean_msg2 = NoiseHandshake::process_msg1(clean_responder, clean_msg1);
+    ASSERT_TRUE(clean_msg2.is_ok());
+
+    auto msg3 = NoiseHandshake::process_msg2(clean_initiator, clean_msg2.value());
     ASSERT_TRUE(msg3.is_ok());
 
     auto tampered_msg3 = msg3.value();
     tampered_msg3.back() ^= 0x01;
-    auto bad_msg3 = NoiseHandshake::process_msg3(responder, tampered_msg3);
+    auto bad_msg3 = NoiseHandshake::process_msg3(clean_responder, tampered_msg3);
     ASSERT_TRUE(bad_msg3.is_err());
     EXPECT_EQ(bad_msg3.error_message(), "noise::decrypt failed");
-    EXPECT_FALSE(responder.handshake_complete);
+    EXPECT_FALSE(clean_responder.handshake_complete);
 }
 
 TEST(NoiseHandshake, FramesMessagesWithTwoByteLengthPrefix) {

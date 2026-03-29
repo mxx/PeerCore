@@ -8,9 +8,8 @@
 
 namespace peercore::protocol::noise {
 
-// Minimal Noise-like handshake scaffold over a raw transport.
+// Minimal libp2p Noise XX handshake over a raw transport.
 // Uses libsodium for Curve25519 DH, ChaCha20-Poly1305 AEAD, and SHA-256.
-// TODO: upgrade this to the full libp2p Noise XX handshake with identity payloads.
 
 struct NoiseKeypair {
     std::array<uint8_t, 32> public_key{};
@@ -20,6 +19,7 @@ struct NoiseKeypair {
 struct CipherState {
     std::array<uint8_t, 32> key{};
     uint64_t nonce{0};
+    bool     has_key{false};
 };
 
 struct NoiseExtensions {
@@ -38,13 +38,12 @@ struct NoiseSession {
     NoiseKeypair static_key;
     std::array<uint8_t, 32> remote_ephemeral_pub{};
     bool has_remote_ephemeral{false};
-    std::array<uint8_t, 32> handshake_ee{};
-    bool has_handshake_ee{false};
-    std::array<uint8_t, 32> handshake_es{};
-    bool has_handshake_es{false};
-
-    // Remote static public key (available after handshake)
     std::array<uint8_t, 32> remote_static_pub{};
+    bool has_remote_static{false};
+
+    std::array<uint8_t, 32> chaining_key{};
+    std::array<uint8_t, 32> handshake_hash{};
+    CipherState             handshake_cipher;
 
     // Derived transport cipher states (send / receive)
     CipherState cs_send;
