@@ -126,15 +126,14 @@ TEST(ConnectionSession, RunsNoiseHandshakeBeforeReady) {
     EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Secured);
     EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
     EXPECT_EQ(outbound_events[1].detail,
-              "selected stream muxer hint: /yamux/1.0.0 (single-stream fallback)");
+              "selected stream muxer: /yamux/1.0.0");
 
     auto inbound_events = drain_events(*inbound);
-    ASSERT_GE(inbound_events.size(), 3u);
+    ASSERT_GE(inbound_events.size(), 2u);
     EXPECT_EQ(inbound_events[0].type, ConnectionEvent::Type::Secured);
     EXPECT_EQ(inbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
     EXPECT_EQ(inbound_events[1].detail,
-              "selected stream muxer hint: /yamux/1.0.0 (single-stream fallback)");
-    EXPECT_EQ(inbound_events[2].type, ConnectionEvent::Type::StreamAccepted);
+              "selected stream muxer: /yamux/1.0.0");
 
     sockets.local = -1;
     sockets.peer = -1;
@@ -208,6 +207,86 @@ TEST(ConnectionSession, EncryptsBidirectionalStreamIoAfterHandshake) {
     auto closed = outbound->next_event();
     ASSERT_TRUE(closed.has_value());
     EXPECT_EQ(closed->type, ConnectionEvent::Type::Closed);
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, MultiplexesMultipleStreamsWhenYamuxIsNegotiated) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7,
+        sockets.local,
+        Multiaddr("/ip4/127.0.0.1/tcp/4001"),
+        outbound_identity,
+        {"/yamux/1.0.0"});
+    auto inbound = make_inbound_connection_session(
+        8,
+        sockets.peer,
+        Multiaddr("/ip4/127.0.0.1/tcp/4002"),
+        inbound_identity,
+        {"/yamux/1.0.0"});
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
+
+    ASSERT_EQ(outbound->state(), ConnectionState::Ready);
+    ASSERT_EQ(inbound->state(), ConnectionState::Ready);
+
+    drain_events(*outbound);
+    drain_events(*inbound);
+
+    auto stream1_res = outbound->request_open_stream("/chat/1.0.0");
+    ASSERT_TRUE(stream1_res.is_ok());
+    auto stream2_res = outbound->request_open_stream("/file/1.0.0");
+    ASSERT_TRUE(stream2_res.is_ok());
+    ASSERT_NE(stream1_res.value()->id(), stream2_res.value()->id());
+
+    drive_sessions(*outbound, *inbound, 16);
+
+    auto inbound_stream1 = inbound->accept_inbound_stream();
+    ASSERT_TRUE(inbound_stream1.has_value());
+    auto inbound_stream2 = inbound->accept_inbound_stream();
+    ASSERT_TRUE(inbound_stream2.has_value());
+    ASSERT_NE((*inbound_stream1)->id(), (*inbound_stream2)->id());
+
+    const std::array<uint8_t, 5> alpha{{'a', 'l', 'p', 'h', 'a'}};
+    const std::array<uint8_t, 4> beta{{'b', 'e', 't', 'a'}};
+    ASSERT_TRUE(stream1_res.value()->try_write(alpha).is_ok());
+    ASSERT_TRUE(stream2_res.value()->try_write(beta).is_ok());
+
+    drive_sessions(*outbound, *inbound, 16);
+
+    std::array<uint8_t, 16> read_buf{};
+    auto read_alpha = (*inbound_stream1)->try_read(read_buf);
+    if (!read_alpha.is_ok() ||
+        std::string(reinterpret_cast<const char*>(read_buf.data()), read_alpha.value()) != "alpha") {
+        read_buf.fill(0);
+        read_alpha = (*inbound_stream2)->try_read(read_buf);
+    }
+    ASSERT_TRUE(read_alpha.is_ok());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_alpha.value()), "alpha");
+
+    read_buf.fill(0);
+    auto read_beta = (*inbound_stream1)->try_read(read_buf);
+    if (!read_beta.is_ok() ||
+        std::string(reinterpret_cast<const char*>(read_buf.data()), read_beta.value()) != "beta") {
+        read_buf.fill(0);
+        read_beta = (*inbound_stream2)->try_read(read_buf);
+    }
+    ASSERT_TRUE(read_beta.is_ok());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_beta.value()), "beta");
 
     sockets.local = -1;
     sockets.peer = -1;

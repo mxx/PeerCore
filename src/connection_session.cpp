@@ -2,6 +2,7 @@
 
 #include "protocol/multistream_select.hpp"
 #include "protocol/noise/noise.hpp"
+#include "protocol/yamux/yamux.hpp"
 
 #include <algorithm>
 #include <array>
@@ -17,6 +18,7 @@ namespace {
 
 using protocol::noise::NoiseHandshake;
 using protocol::noise::NoiseSession;
+using protocol::yamux::YamuxSession;
 using protocol::MultistreamSelect;
 
 enum class HandshakeState {
@@ -223,6 +225,19 @@ Result<size_t> queue_encrypted_write(StreamState& state, ConstBytes data) {
     return Result<size_t>::ok(data.size());
 }
 
+Result<void> queue_encrypted_message(SessionIoState& io,
+                                     SecureChannelState& secure,
+                                     ConstBytes data) {
+    auto ciphertext = NoiseHandshake::encrypt(secure.noise.cs_send, data);
+    if (ciphertext.is_err()) {
+        return Result<void>::err(ciphertext.error().message);
+    }
+
+    auto queued = queue_wire_message(io, ciphertext.value());
+    if (queued.is_err()) return queued;
+    return flush_wire(io);
+}
+
 std::optional<ProtocolId> select_stream_muxer(const NoiseSession& noise) {
     if (noise.local_extensions.stream_muxers.empty() ||
         noise.remote_extensions.stream_muxers.empty()) {
@@ -405,6 +420,17 @@ public:
         if (state_ != ConnectionState::Ready) {
             return Result<StreamHandle>::err("connection is not ready");
         }
+        if (yamux_session_) {
+            auto stream = yamux_session_->open_stream();
+            if (stream.is_err()) return Result<StreamHandle>::err(stream.error().message);
+            stream.value()->set_protocol(protocol);
+            event_queue_.push_back(ConnectionEvent{
+                .type = ConnectionEvent::Type::StreamOpened,
+                .stream_id = stream.value()->id(),
+                .detail = "outbound yamux stream opened",
+            });
+            return Result<StreamHandle>::ok(stream.value());
+        }
         if (stream_state_ && stream_state_->open) {
             return Result<StreamHandle>::err("direct connection only supports one open stream");
         }
@@ -496,6 +522,12 @@ private:
 
             auto plaintext = NoiseHandshake::decrypt(secure_->noise.cs_recv, frame);
             if (plaintext.is_err()) return Result<void>::err(plaintext.error().message);
+
+            if (yamux_session_) {
+                auto received = yamux_session_->receive(plaintext.value());
+                if (received.is_err()) return received;
+                continue;
+            }
 
             auto stream = ensure_inbound_stream();
             stream->rx_buffer.insert(stream->rx_buffer.end(),
@@ -631,6 +663,9 @@ private:
         if (expected_peer.is_err()) return expected_peer;
 
         secure_->negotiated_stream_muxer = select_stream_muxer(secure_->noise);
+        if (secure_->negotiated_stream_muxer == std::optional<ProtocolId>("/yamux/1.0.0")) {
+            activate_yamux();
+        }
         secure_->stage = SecurityStage::Ready;
         secure_->secure_ready = true;
         state_ = ConnectionState::SecureReady;
@@ -645,18 +680,43 @@ private:
             .type = ConnectionEvent::Type::MultiplexerReady,
             .stream_id = std::nullopt,
             .detail = secure_->negotiated_stream_muxer.has_value()
-                          ? "selected stream muxer hint: " +
+                          ? "selected stream muxer: " +
                                 *secure_->negotiated_stream_muxer +
-                                " (single-stream fallback)"
+                                (yamux_session_ ? "" : " (single-stream fallback)")
                           : "noise secure channel ready (single-stream fallback)",
         });
 
         state_ = ConnectionState::Ready;
-        if (create_inbound_stream_on_ready_ && pending_inbound_streams_.empty()) {
+        if (!yamux_session_ &&
+            create_inbound_stream_on_ready_ &&
+            pending_inbound_streams_.empty()) {
             create_stream(std::nullopt, /*inbound_event=*/true);
             create_inbound_stream_on_ready_ = false;
         }
         return Result<void>::ok();
+    }
+
+    void activate_yamux() {
+        yamux_session_ = std::make_shared<YamuxSession>(id_, is_initiator_);
+        yamux_session_->set_accept_callback([this](std::shared_ptr<protocol::yamux::YamuxStream> stream) {
+            pending_inbound_streams_.push_back(stream);
+            event_queue_.push_back(ConnectionEvent{
+                .type = ConnectionEvent::Type::StreamAccepted,
+                .stream_id = stream->id(),
+                .detail = "inbound yamux stream ready",
+            });
+        });
+        yamux_session_->set_outgoing_callback([this]() {
+            return flush_yamux_outgoing();
+        });
+        create_inbound_stream_on_ready_ = false;
+    }
+
+    Result<void> flush_yamux_outgoing() {
+        if (!yamux_session_) return Result<void>::ok();
+        auto plaintext = yamux_session_->drain_outgoing();
+        if (plaintext.empty()) return Result<void>::ok();
+        return queue_encrypted_message(*io_, *secure_, plaintext);
     }
 
     void emit_error(std::string detail) {
@@ -706,6 +766,7 @@ private:
     std::shared_ptr<StreamState>     stream_state_;
     std::vector<ConnectionEvent>     event_queue_;
     std::vector<StreamHandle>        pending_inbound_streams_;
+    std::shared_ptr<YamuxSession>    yamux_session_;
     StreamId                         next_stream_id_{1};
     bool                             closed_emitted_{false};
     bool                             is_initiator_{false};

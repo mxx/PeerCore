@@ -6,6 +6,7 @@
 #include <deque>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -28,7 +29,14 @@ enum class YamuxFlag : uint16_t { SYN = 1, ACK = 2, FIN = 4, RST = 8 };
 // Single yamux-managed stream
 class YamuxStream : public MuxedStream {
 public:
-    YamuxStream(StreamId id, ConnectionId conn_id);
+    using WriteCallback = std::function<Result<void>(StreamId, ConstBytes)>;
+    using CloseCallback = std::function<Result<void>(StreamId)>;
+
+    YamuxStream(StreamId id,
+                ConnectionId conn_id,
+                WriteCallback write_cb,
+                CloseCallback close_write_cb,
+                CloseCallback reset_cb);
 
     StreamId     id()            const override;
     ConnectionId connection_id() const override;
@@ -47,12 +55,16 @@ public:
     void receive_rst();
 
     void set_protocol(ProtocolId proto);
+    void close_local_write();
 
 private:
     StreamId     id_;
     ConnectionId conn_id_;
     bool         open_{true};
     bool         write_closed_{false};
+    WriteCallback write_cb_;
+    CloseCallback close_write_cb_;
+    CloseCallback reset_cb_;
 
     std::deque<uint8_t>     recv_buf_;
     std::optional<ProtocolId> protocol_;
@@ -62,6 +74,7 @@ private:
 class YamuxSession {
 public:
     using AcceptCallback = std::function<void(std::shared_ptr<YamuxStream>)>;
+    using OutgoingCallback = std::function<Result<void>()>;
 
     explicit YamuxSession(ConnectionId conn_id, bool is_client);
 
@@ -76,16 +89,22 @@ public:
 
     // Set callback for inbound streams (server side)
     void set_accept_callback(AcceptCallback cb);
+    void set_outgoing_callback(OutgoingCallback cb);
 
 private:
     ConnectionId conn_id_;
-    bool         is_client_;
     uint32_t     next_stream_id_;
 
     std::unordered_map<StreamId, std::shared_ptr<YamuxStream>> streams_;
     std::vector<uint8_t>  recv_buf_;   // unparsed incoming bytes
     std::vector<uint8_t>  send_buf_;   // pending outgoing bytes
     AcceptCallback        accept_cb_;
+    OutgoingCallback      outgoing_cb_;
+
+    std::shared_ptr<YamuxStream> get_or_create_stream(StreamId sid, bool open_if_missing);
+    Result<void> write_stream_data(StreamId sid, ConstBytes data);
+    Result<void> close_stream_write(StreamId sid);
+    Result<void> reset_stream(StreamId sid);
 
     void        process_frames();
     bool        try_parse_frame(YamuxHeader& hdr, std::vector<uint8_t>& payload);
