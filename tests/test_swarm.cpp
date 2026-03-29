@@ -30,6 +30,42 @@ Identity make_identity() {
     return identity;
 }
 
+class EchoHandler final : public ProtocolHandler {
+public:
+    explicit EchoHandler(ProtocolId proto) : proto_(std::move(proto)) {}
+
+    ProtocolId protocol_id() const override { return proto_; }
+
+    void on_inbound_stream(StreamHandle stream) override {
+        inbound_streams_.push_back(std::move(stream));
+    }
+
+    void on_outbound_stream_ready(StreamHandle stream) override {
+        outbound_ready_.push_back(std::move(stream));
+    }
+
+    void on_tick() override {
+        std::vector<StreamHandle> still_open;
+        std::array<uint8_t, 512> buf{};
+        for (auto& stream : inbound_streams_) {
+            auto read = stream->try_read(buf);
+            if (read.is_ok() && read.value() > 0) {
+                auto write = stream->try_write(ConstBytes(buf.data(), read.value()));
+                EXPECT_TRUE(write.is_ok()) << write.error().message;
+            }
+            if (stream->is_open()) still_open.push_back(stream);
+        }
+        inbound_streams_ = std::move(still_open);
+    }
+
+    size_t outbound_ready_count() const { return outbound_ready_.size(); }
+
+private:
+    ProtocolId proto_;
+    std::vector<StreamHandle> inbound_streams_;
+    std::vector<StreamHandle> outbound_ready_;
+};
+
 }  // namespace
 
 TEST(Swarm, StartStop) {
@@ -236,4 +272,154 @@ TEST(Swarm, PropagatesYamuxResetAsStreamClosedEvent) {
     EXPECT_TRUE(connected);
     EXPECT_TRUE(server_stream_accepted);
     EXPECT_TRUE(server_stream_closed);
+}
+
+TEST(Swarm, NegotiatesStreamProtocolAndDispatchesHandler) {
+    ASSERT_GE(::sodium_init(), 0);
+    PeerStore server_store;
+    PeerStore client_store;
+    auto server_identity = make_identity();
+    auto client_identity = make_identity();
+    Swarm server(server_store, server_identity, {"/yamux/1.0.0"});
+    Swarm client(client_store, client_identity, {"/yamux/1.0.0"});
+    auto echo_handler = std::make_shared<EchoHandler>("/test/echo/1.0.0");
+    server.register_handler(echo_handler);
+
+    ASSERT_TRUE(server.start().is_ok());
+    ASSERT_TRUE(client.start().is_ok());
+
+    auto listen_res = server.listen_on(Multiaddr("/ip4/127.0.0.1/tcp/0"));
+    if (listen_res.is_err() &&
+        listen_res.error_message().find("Operation not permitted") != std::string::npos) {
+        GTEST_SKIP() << listen_res.error_message();
+    }
+    ASSERT_TRUE(listen_res.is_ok()) << listen_res.error_message();
+
+    auto listen_events = drain_events(server);
+    ASSERT_FALSE(listen_events.empty());
+    ASSERT_EQ(listen_events.front().type, SwarmEvent::Type::ListenerStarted);
+
+    ASSERT_TRUE(client.dial_addr(Multiaddr::from_ip4_tcp(
+        "127.0.0.1",
+        static_cast<uint16_t>(std::stoi(
+            listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
+        kTestPeerId)).is_ok());
+
+    bool connected = false;
+    bool stream_protocol_ready = false;
+    bool server_stream_protocol_ready = false;
+    std::optional<StreamHandle> client_stream;
+    std::string echoed;
+
+    for (int i = 0; i < 160; ++i) {
+        server.poll_once();
+        client.poll_once();
+
+        for (auto& ev : drain_events(client)) {
+            if (ev.type == SwarmEvent::Type::ConnectionEstablished &&
+                ev.peer_id == std::optional<PeerId>(server_identity.peer_id)) {
+                connected = true;
+            }
+            if (ev.type == SwarmEvent::Type::ProtocolNegotiated &&
+                ev.stream_id.has_value() &&
+                ev.detail == "/test/echo/1.0.0") {
+                stream_protocol_ready = true;
+            }
+        }
+        for (auto& ev : drain_events(server)) {
+            if (ev.type == SwarmEvent::Type::ProtocolNegotiated &&
+                ev.stream_id.has_value() &&
+                ev.detail == "/test/echo/1.0.0") {
+                server_stream_protocol_ready = true;
+            }
+        }
+
+        if (connected && !client_stream.has_value()) {
+            auto stream_res = client.open_stream(server_identity.peer_id, "/test/echo/1.0.0");
+            ASSERT_TRUE(stream_res.is_ok()) << stream_res.error().message;
+            client_stream = stream_res.value();
+        }
+
+        if (stream_protocol_ready && client_stream.has_value() && echoed.empty()) {
+            static const std::array<uint8_t, 5> hello{{'h', 'e', 'l', 'l', 'o'}};
+            auto write = (*client_stream)->try_write(hello);
+            if (write.is_ok()) {
+                std::array<uint8_t, 16> read_buf{};
+                auto read = (*client_stream)->try_read(read_buf);
+                if (read.is_ok() && read.value() > 0) {
+                    echoed.assign(reinterpret_cast<const char*>(read_buf.data()), read.value());
+                }
+            }
+        }
+
+        if (server_stream_protocol_ready && echoed == "hello") break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_TRUE(connected);
+    EXPECT_TRUE(stream_protocol_ready);
+    EXPECT_TRUE(server_stream_protocol_ready);
+    EXPECT_EQ(echoed, "hello");
+}
+
+TEST(Swarm, ReportsUnsupportedStreamProtocolNegotiationFailure) {
+    ASSERT_GE(::sodium_init(), 0);
+    PeerStore server_store;
+    PeerStore client_store;
+    auto server_identity = make_identity();
+    auto client_identity = make_identity();
+    Swarm server(server_store, server_identity, {"/yamux/1.0.0"});
+    Swarm client(client_store, client_identity, {"/yamux/1.0.0"});
+
+    ASSERT_TRUE(server.start().is_ok());
+    ASSERT_TRUE(client.start().is_ok());
+
+    auto listen_res = server.listen_on(Multiaddr("/ip4/127.0.0.1/tcp/0"));
+    if (listen_res.is_err() &&
+        listen_res.error_message().find("Operation not permitted") != std::string::npos) {
+        GTEST_SKIP() << listen_res.error_message();
+    }
+    ASSERT_TRUE(listen_res.is_ok()) << listen_res.error_message();
+
+    auto listen_events = drain_events(server);
+    ASSERT_FALSE(listen_events.empty());
+    ASSERT_EQ(listen_events.front().type, SwarmEvent::Type::ListenerStarted);
+
+    ASSERT_TRUE(client.dial_addr(Multiaddr::from_ip4_tcp(
+        "127.0.0.1",
+        static_cast<uint16_t>(std::stoi(
+            listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
+        kTestPeerId)).is_ok());
+
+    bool connected = false;
+    bool protocol_failed = false;
+
+    for (int i = 0; i < 160; ++i) {
+        server.poll_once();
+        client.poll_once();
+
+        for (auto& ev : drain_events(client)) {
+            if (ev.type == SwarmEvent::Type::ConnectionEstablished &&
+                ev.peer_id == std::optional<PeerId>(server_identity.peer_id)) {
+                connected = true;
+            }
+            if (ev.type == SwarmEvent::Type::ProtocolError &&
+                ev.stream_id.has_value() &&
+                ev.detail == "protocol not supported") {
+                protocol_failed = true;
+            }
+        }
+        drain_events(server);
+
+        if (connected && !protocol_failed) {
+            auto stream_res = client.open_stream(server_identity.peer_id, "/test/missing/1.0.0");
+            ASSERT_TRUE(stream_res.is_ok()) << stream_res.error().message;
+            connected = false;
+        }
+
+        if (protocol_failed) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_TRUE(protocol_failed);
 }

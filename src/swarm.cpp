@@ -1,9 +1,12 @@
 #include "../include/peercore/swarm.hpp"
 
+#include "protocol/multistream_select.hpp"
 #include "runtime/event_loop.hpp"
 #include "transport/tcp_transport.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstdint>
 #include <utility>
 
 namespace peercore {
@@ -13,6 +16,279 @@ namespace {
 std::string dial_failed_detail(const Multiaddr& addr, const std::string& detail) {
     return addr.to_string() + ": " + detail;
 }
+
+Result<uint64_t> decode_multistream_length(ConstBytes& buf) {
+    uint64_t value = 0;
+    uint32_t shift = 0;
+    size_t index = 0;
+    while (index < buf.size()) {
+        const uint8_t byte = buf[index++];
+        value |= static_cast<uint64_t>(byte & 0x7F) << shift;
+        if ((byte & 0x80) == 0) {
+            buf = buf.subspan(index);
+            return Result<uint64_t>::ok(value);
+        }
+        shift += 7;
+        if (shift >= 64) {
+            return Result<uint64_t>::err("invalid multistream length");
+        }
+    }
+    return Result<uint64_t>::err("incomplete multistream length");
+}
+
+bool is_incomplete_multistream_error(std::string_view error) {
+    return error == "incomplete multistream length" ||
+           error == "incomplete multistream message";
+}
+
+Result<size_t> multistream_message_span(ConstBytes buf) {
+    auto remaining = buf;
+    auto len = decode_multistream_length(remaining);
+    if (len.is_err()) return Result<size_t>::err(len.error().message);
+    if (remaining.size() < len.value()) {
+        return Result<size_t>::err("incomplete multistream message");
+    }
+    return Result<size_t>::ok(buf.size() - remaining.size() + len.value());
+}
+
+Result<size_t> multistream_exchange_span(ConstBytes buf) {
+    auto first = multistream_message_span(buf);
+    if (first.is_err()) return first;
+    buf = buf.subspan(first.value());
+
+    auto second = multistream_message_span(buf);
+    if (second.is_err()) return second;
+    return Result<size_t>::ok(first.value() + second.value());
+}
+
+class ProtocolNegotiatingStream final : public MuxedStream {
+public:
+    ProtocolNegotiatingStream(ConnectionId conn_id,
+                              StreamHandle inner,
+                              ProtocolId desired_protocol)
+        : conn_id_(conn_id)
+        , inner_(std::move(inner))
+        , desired_protocol_(std::move(desired_protocol))
+        , inbound_(false)
+        , stage_(Stage::SendingOutboundProposal) {}
+
+    ProtocolNegotiatingStream(ConnectionId conn_id,
+                              StreamHandle inner,
+                              std::vector<ProtocolId> supported_protocols)
+        : conn_id_(conn_id)
+        , inner_(std::move(inner))
+        , supported_protocols_(std::move(supported_protocols))
+        , inbound_(true)
+        , stage_(Stage::AwaitingInboundProposal) {}
+
+    StreamId id() const override { return inner_->id(); }
+    ConnectionId connection_id() const override { return conn_id_; }
+
+    Result<size_t> try_read(MutableBytes buf) override {
+        auto progressed = poll();
+        if (progressed.is_err()) {
+            return Result<size_t>::err(progressed.error_message());
+        }
+        if (!is_negotiated()) {
+            return Result<size_t>::err("stream protocol negotiation not complete");
+        }
+
+        if (!app_rx_buffer_.empty()) {
+            const size_t n = std::min(buf.size(), app_rx_buffer_.size());
+            std::copy_n(app_rx_buffer_.begin(), n, buf.begin());
+            app_rx_buffer_.erase(app_rx_buffer_.begin(),
+                                 app_rx_buffer_.begin() + static_cast<std::ptrdiff_t>(n));
+            return Result<size_t>::ok(n);
+        }
+
+        return inner_->try_read(buf);
+    }
+
+    Result<size_t> try_write(ConstBytes data) override {
+        auto progressed = poll();
+        if (progressed.is_err()) {
+            return Result<size_t>::err(progressed.error_message());
+        }
+        if (!is_negotiated()) {
+            return Result<size_t>::err("stream protocol negotiation not complete");
+        }
+        return inner_->try_write(data);
+    }
+
+    Result<void> close_write() override {
+        auto progressed = poll();
+        if (progressed.is_err()) return progressed;
+        if (!is_negotiated()) {
+            return Result<void>::err("stream protocol negotiation not complete");
+        }
+        return inner_->close_write();
+    }
+
+    Result<void> reset() override {
+        stage_ = Stage::Failed;
+        if (!failure_detail_.has_value()) {
+            failure_detail_ = "stream reset locally";
+        }
+        return inner_->reset();
+    }
+
+    bool is_open() const override {
+        return inner_->is_open();
+    }
+
+    std::optional<ProtocolId> negotiated_protocol() const override {
+        return negotiated_protocol_;
+    }
+
+    Result<void> poll() {
+        if (stage_ == Stage::Ready) return Result<void>::ok();
+        if (stage_ == Stage::Failed) {
+            return Result<void>::err(failure_detail_.value_or("stream protocol negotiation failed"));
+        }
+
+        if (stage_ == Stage::SendingOutboundProposal) {
+            auto proposal = protocol::MultistreamSelect::prepare_outbound({desired_protocol_});
+            if (proposal.is_err()) {
+                return fail(proposal.error().message);
+            }
+            auto wrote = inner_->try_write(proposal.value());
+            if (wrote.is_err()) {
+                return fail(wrote.error().message);
+            }
+            stage_ = Stage::AwaitingOutboundResponse;
+        }
+
+        auto incoming = read_into_negotiation_buffer();
+        if (incoming.is_err()) {
+            return fail(incoming.error_message());
+        }
+
+        if (stage_ == Stage::AwaitingOutboundResponse) {
+            auto span = multistream_exchange_span(
+                ConstBytes(negotiation_buffer_.data(), negotiation_buffer_.size()));
+            if (span.is_err()) {
+                if (is_incomplete_multistream_error(span.error().message)) {
+                    return Result<void>::ok();
+                }
+                return fail(span.error().message);
+            }
+
+            ConstBytes response(negotiation_buffer_.data(), span.value());
+            auto selected = protocol::MultistreamSelect::read_outbound_response(
+                response, desired_protocol_);
+            if (selected.is_err()) {
+                return fail(selected.error().message);
+            }
+
+            negotiated_protocol_ = selected.value();
+            finish_negotiation(span.value());
+        } else if (stage_ == Stage::AwaitingInboundProposal) {
+            auto span = multistream_exchange_span(
+                ConstBytes(negotiation_buffer_.data(), negotiation_buffer_.size()));
+            if (span.is_err()) {
+                if (is_incomplete_multistream_error(span.error().message)) {
+                    return Result<void>::ok();
+                }
+                return fail(span.error().message);
+            }
+
+            ConstBytes request(negotiation_buffer_.data(), span.value());
+            auto negotiation = protocol::MultistreamSelect::negotiate_inbound(
+                request, supported_protocols_);
+            if (negotiation.is_err()) {
+                return fail(negotiation.error().message);
+            }
+
+            auto wrote = inner_->try_write(negotiation.value().outbound);
+            if (wrote.is_err()) {
+                return fail(wrote.error().message);
+            }
+
+            if (!negotiation.value().protocol.has_value()) {
+                (void)inner_->reset();
+                return fail("protocol not supported");
+            }
+
+            negotiated_protocol_ = *negotiation.value().protocol;
+            finish_negotiation(span.value());
+        }
+
+        return Result<void>::ok();
+    }
+
+    bool is_negotiated() const {
+        return stage_ == Stage::Ready && negotiated_protocol_.has_value();
+    }
+
+    bool has_failed() const {
+        return stage_ == Stage::Failed;
+    }
+
+    bool is_inbound() const {
+        return inbound_;
+    }
+
+    std::string failure_detail() const {
+        return failure_detail_.value_or("stream protocol negotiation failed");
+    }
+
+private:
+    enum class Stage {
+        SendingOutboundProposal,
+        AwaitingOutboundResponse,
+        AwaitingInboundProposal,
+        Ready,
+        Failed,
+    };
+
+    Result<void> read_into_negotiation_buffer() {
+        std::array<uint8_t, 1024> buf{};
+        while (true) {
+            auto read = inner_->try_read(buf);
+            if (read.is_err()) {
+                if (read.error().message == "EAGAIN") return Result<void>::ok();
+                return Result<void>::err(read.error().message);
+            }
+            if (read.value() == 0) {
+                if (!inner_->is_open()) {
+                    return Result<void>::err("stream closed during protocol negotiation");
+                }
+                return Result<void>::ok();
+            }
+            negotiation_buffer_.insert(negotiation_buffer_.end(),
+                                       buf.begin(),
+                                       buf.begin() + static_cast<std::ptrdiff_t>(read.value()));
+        }
+    }
+
+    void finish_negotiation(size_t consumed) {
+        if (negotiation_buffer_.size() > consumed) {
+            app_rx_buffer_.insert(app_rx_buffer_.end(),
+                                  negotiation_buffer_.begin() +
+                                      static_cast<std::ptrdiff_t>(consumed),
+                                  negotiation_buffer_.end());
+        }
+        negotiation_buffer_.clear();
+        stage_ = Stage::Ready;
+    }
+
+    Result<void> fail(std::string detail) {
+        stage_ = Stage::Failed;
+        failure_detail_ = std::move(detail);
+        return Result<void>::err(*failure_detail_);
+    }
+
+    ConnectionId conn_id_{0};
+    StreamHandle inner_;
+    ProtocolId desired_protocol_;
+    std::vector<ProtocolId> supported_protocols_;
+    bool inbound_{false};
+    Stage stage_{Stage::SendingOutboundProposal};
+    std::vector<uint8_t> negotiation_buffer_;
+    std::vector<uint8_t> app_rx_buffer_;
+    std::optional<ProtocolId> negotiated_protocol_;
+    std::optional<std::string> failure_detail_;
+};
 
 }  // namespace
 
@@ -190,12 +466,17 @@ Result<StreamHandle> Swarm::open_stream(ConnectionId conn_id, ProtocolId proto) 
     auto stream = it->second->request_open_stream(proto);
     if (stream.is_err()) return stream;
 
+    auto negotiated_stream = std::make_shared<ProtocolNegotiatingStream>(
+        conn_id, stream.value(), proto);
+    pending_streams_[stream_key(conn_id, negotiated_stream->id())] = negotiated_stream;
+
     std::vector<ConnectionId> closed_connections;
     drain_connection_events_for(conn_id, closed_connections);
     for (const auto closed_id : closed_connections) {
         remove_connection(closed_id);
     }
-    return stream;
+    poll_pending_streams();
+    return Result<StreamHandle>::ok(std::move(negotiated_stream));
 }
 
 Result<StreamHandle> Swarm::open_stream(const PeerId& peer, ProtocolId proto) {
@@ -219,6 +500,11 @@ void Swarm::poll_once() {
     event_loop_->poll_once();
     sync_transport_fds();
     drain_connection_events();
+    poll_pending_streams();
+
+    for (auto& h : handlers_) {
+        h->on_tick();
+    }
 
     controller_->on_timer_tick();
     for (const auto& action : controller_->drain_actions()) {
@@ -242,9 +528,6 @@ DebugSnapshot Swarm::snapshot() const {
 }
 
 void Swarm::dispatch_event(SwarmEvent event) {
-    for (auto& h : handlers_) {
-        h->on_tick();
-    }
     controller_->on_swarm_event(event);
     event_queue_.push_back(std::move(event));
 }
@@ -281,6 +564,89 @@ ProtocolHandler* Swarm::find_handler(const ProtocolId& proto) {
         if (h->protocol_id() == proto) return h.get();
     }
     return nullptr;
+}
+
+std::vector<ProtocolId> Swarm::supported_protocols() const {
+    std::vector<ProtocolId> protocols;
+    protocols.reserve(handlers_.size());
+    for (const auto& handler : handlers_) {
+        protocols.push_back(handler->protocol_id());
+    }
+    return protocols;
+}
+
+uint64_t Swarm::stream_key(ConnectionId conn_id, StreamId stream_id) const {
+    return (static_cast<uint64_t>(conn_id) << 32) | stream_id;
+}
+
+void Swarm::poll_pending_streams() {
+    std::vector<uint64_t> completed;
+    std::vector<uint64_t> failed;
+
+    for (auto& [key, handle] : pending_streams_) {
+        auto negotiating = std::dynamic_pointer_cast<ProtocolNegotiatingStream>(handle);
+        if (!negotiating) {
+            completed.push_back(key);
+            continue;
+        }
+
+        auto progress = negotiating->poll();
+        if (progress.is_err() && !negotiating->has_failed()) {
+            continue;
+        }
+
+        if (negotiating->has_failed()) {
+            std::optional<PeerId> peer_id;
+            if (auto peer_it = connection_peers_.find(negotiating->connection_id());
+                peer_it != connection_peers_.end()) {
+                auto parsed = PeerId::from_string(peer_it->second);
+                if (parsed.is_ok()) peer_id = parsed.value();
+            }
+            dispatch_event(SwarmEvent{
+                .type = SwarmEvent::Type::ProtocolError,
+                .connection_id = negotiating->connection_id(),
+                .stream_id = negotiating->id(),
+                .peer_id = peer_id,
+                .detail = negotiating->failure_detail(),
+            });
+            failed.push_back(key);
+            continue;
+        }
+
+        if (!negotiating->is_negotiated()) continue;
+
+        std::optional<PeerId> peer_id;
+        if (auto peer_it = connection_peers_.find(negotiating->connection_id());
+            peer_it != connection_peers_.end()) {
+            auto parsed = PeerId::from_string(peer_it->second);
+            if (parsed.is_ok()) peer_id = parsed.value();
+        }
+
+        dispatch_event(SwarmEvent{
+            .type = SwarmEvent::Type::ProtocolNegotiated,
+            .connection_id = negotiating->connection_id(),
+            .stream_id = negotiating->id(),
+            .peer_id = peer_id,
+            .detail = *negotiating->negotiated_protocol(),
+        });
+
+        if (auto* handler = find_handler(*negotiating->negotiated_protocol())) {
+            if (negotiating->is_inbound()) {
+                handler->on_inbound_stream(handle);
+            } else {
+                handler->on_outbound_stream_ready(handle);
+            }
+        }
+
+        completed.push_back(key);
+    }
+
+    for (const auto key : completed) {
+        pending_streams_.erase(key);
+    }
+    for (const auto key : failed) {
+        pending_streams_.erase(key);
+    }
 }
 
 void Swarm::sync_transport_fds() {
@@ -434,6 +800,18 @@ void Swarm::handle_connection_event(ConnectionId id,
             });
             break;
         case ConnectionEvent::Type::StreamAccepted:
+            if (event.stream_id.has_value()) {
+                auto conn_it = connections_.find(id);
+                if (conn_it != connections_.end()) {
+                    auto stream = conn_it->second->accept_inbound_stream();
+                    if (stream.has_value()) {
+                        auto negotiated_stream = std::make_shared<ProtocolNegotiatingStream>(
+                            id, *stream, supported_protocols());
+                        pending_streams_[stream_key(id, negotiated_stream->id())] =
+                            negotiated_stream;
+                    }
+                }
+            }
             dispatch_event(SwarmEvent{
                 .type = SwarmEvent::Type::StreamAccepted,
                 .connection_id = id,
@@ -477,6 +855,14 @@ void Swarm::remove_connection(ConnectionId id) {
     if (auto peer_it = connection_peers_.find(id); peer_it != connection_peers_.end()) {
         peer_connections_.erase(peer_it->second);
         connection_peers_.erase(peer_it);
+    }
+    for (auto it = pending_streams_.begin(); it != pending_streams_.end();) {
+        const auto conn_id = static_cast<ConnectionId>(it->first >> 32);
+        if (conn_id == id) {
+            it = pending_streams_.erase(it);
+            continue;
+        }
+        ++it;
     }
     auto fd_it = conn_fds_.find(id);
     if (fd_it != conn_fds_.end()) {

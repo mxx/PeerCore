@@ -68,6 +68,27 @@ has_event() {
     grep -q "\"type\":\"${event_name}\"" "$ARTIFACT_DIR/peercore.jsonl"
 }
 
+external_log_file() {
+  if [[ -f "$ARTIFACT_DIR/go-peer.log" ]]; then
+    echo "$ARTIFACT_DIR/go-peer.log"
+    return 0
+  fi
+  if [[ -f "$ARTIFACT_DIR/rust-peer.log" ]]; then
+    echo "$ARTIFACT_DIR/rust-peer.log"
+    return 0
+  fi
+  return 1
+}
+
+external_has_event() {
+  local event_name="$1"
+  local log_file=""
+  if ! log_file="$(external_log_file)"; then
+    return 1
+  fi
+  grep -q "\"type\":\"${event_name}\"" "$log_file"
+}
+
 last_detail_for() {
   local event_name="$1"
   if [[ ! -f "$ARTIFACT_DIR/peercore.jsonl" ]]; then
@@ -86,10 +107,18 @@ write_summary() {
     classification="PASS"
     stage="connection_established"
     detail="$(last_detail_for connection_established)"
+  elif ! external_has_event ready; then
+    classification="UNEXPECTED_FAIL"
+    stage="external_startup"
+    detail="external libp2p peer did not report ready"
   elif has_event protocol_error; then
-    classification="EXPECTED_FAIL"
-    stage="protocol_error"
     detail="$(last_detail_for protocol_error)"
+    stage="protocol_error"
+    if [[ "$detail" == *noise* || "$detail" == *handshake* || "$detail" == *ciphertext* ]]; then
+      classification="EXPECTED_FAIL"
+    else
+      classification="UNEXPECTED_FAIL"
+    fi
   elif has_event dial_failed; then
     classification="UNEXPECTED_FAIL"
     stage="dial_failed"
@@ -119,6 +148,11 @@ connection_established: $(has_event connection_established && echo yes || echo n
 stream_opened: $(has_event stream_opened && echo yes || echo no)
 protocol_error: $(has_event protocol_error && echo yes || echo no)
 dial_failed: $(has_event dial_failed && echo yes || echo no)
+external_ready: $(external_has_event ready && echo yes || echo no)
+external_connected: $(external_has_event connected && echo yes || echo no)
+external_dial_failed: $(external_has_event dial_failed && echo yes || echo no)
+external_stream_opened: $(external_has_event stream_opened && echo yes || echo no)
+external_stream_echo_received: $(external_has_event stream_echo_received && echo yes || echo no)
 EOF
 }
 
@@ -126,7 +160,7 @@ case "$CASE_NAME" in
   go-outbound)
     docker compose -f "$COMPOSE_FILE" up -d go-peer
     sleep 3
-    run_probe --dial /ip4/127.0.0.1/tcp/41001 --muxer /yamux/1.0.0 --runtime-ms 6000
+    run_probe --dial /ip4/127.0.0.1/tcp/41001 --muxer /yamux/1.0.0 --open-protocol /test/echo/1.0.0 --runtime-ms 6000
     docker compose -f "$COMPOSE_FILE" logs --no-color go-peer > "$ARTIFACT_DIR/go-peer.log"
     ;;
   rust-outbound)

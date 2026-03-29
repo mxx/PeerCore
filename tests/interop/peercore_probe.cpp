@@ -1,9 +1,11 @@
 #include <peercore/peer_store.hpp>
+#include <peercore/protocol_handler.hpp>
 #include <peercore/swarm.hpp>
 
 #include <sodium.h>
 
 #include <chrono>
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <optional>
@@ -23,6 +25,33 @@ Identity make_identity() {
         std::span<const uint8_t, 32>(identity.secret_key.data() + 32, 32));
     return identity;
 }
+
+class EchoHandler final : public ProtocolHandler {
+public:
+    ProtocolId protocol_id() const override { return "/test/echo/1.0.0"; }
+
+    void on_inbound_stream(StreamHandle stream) override {
+        inbound_streams_.push_back(std::move(stream));
+    }
+
+    void on_outbound_stream_ready(StreamHandle /*stream*/) override {}
+
+    void on_tick() override {
+        std::vector<StreamHandle> still_open;
+        std::array<uint8_t, 1024> buf{};
+        for (auto& stream : inbound_streams_) {
+            auto read = stream->try_read(buf);
+            if (read.is_ok() && read.value() > 0) {
+                (void)stream->try_write(ConstBytes(buf.data(), read.value()));
+            }
+            if (stream->is_open()) still_open.push_back(stream);
+        }
+        inbound_streams_ = std::move(still_open);
+    }
+
+private:
+    std::vector<StreamHandle> inbound_streams_;
+};
 
 std::string escape_json(std::string_view value) {
     std::string out;
@@ -119,6 +148,7 @@ int main(int argc, char** argv) {
     PeerStore peer_store;
     auto identity = make_identity();
     Swarm swarm(peer_store, identity, muxers);
+    swarm.register_handler(std::make_shared<EchoHandler>());
 
     auto started = swarm.start();
     if (started.is_err()) {

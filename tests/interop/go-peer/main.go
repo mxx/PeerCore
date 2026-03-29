@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"time"
@@ -109,6 +110,33 @@ func main() {
 			emit("dial_failed", map[string]any{"detail": err.Error()})
 		} else {
 			emit("dial_succeeded", map[string]any{"target": targetAddr})
+			stream, err := host.NewStream(ctx, info.ID, "/test/echo/1.0.0")
+			if err != nil {
+				emit("stream_open_failed", map[string]any{
+					"peer_id": info.ID.String(),
+					"proto":   "/test/echo/1.0.0",
+					"detail":  err.Error(),
+				})
+			} else {
+				emit("stream_opened", map[string]any{
+					"peer_id": info.ID.String(),
+					"proto":   stream.Protocol(),
+				})
+				payload := []byte("interop-ping")
+				if _, err := stream.Write(payload); err != nil {
+					emit("stream_write_failed", map[string]any{"detail": err.Error()})
+				} else {
+					reply := make([]byte, len(payload))
+					if _, err := io.ReadFull(stream, reply); err != nil {
+						emit("stream_read_failed", map[string]any{"detail": err.Error()})
+					} else {
+						emit("stream_echo_received", map[string]any{
+							"payload": string(reply),
+						})
+					}
+				}
+				_ = stream.Close()
+			}
 		}
 	}
 

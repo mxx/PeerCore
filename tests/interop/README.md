@@ -14,8 +14,8 @@ Current limitation:
 
 - PeerCore is not yet expected to fully interoperate with go-libp2p or
   rust-libp2p Noise XX.
-- stream-level multistream-select is not wired yet, so application protocol
-  interoperability is not expected to pass.
+- Rust-side application stream interoperability is still limited by the current
+  external peer scaffold.
 
 ## Layout
 
@@ -54,8 +54,12 @@ failure happens at:
 3. `/noise` negotiation
 4. Noise handshake completion
 5. yamux selection
+6. stream-level protocol negotiation
 
 At the moment, failure during Noise handshake is an expected outcome.
+When the secure channel does complete, the Go-based cases also exercise a
+`/test/echo/1.0.0` stream to help distinguish transport success from
+application-stream success.
 
 ## Usage
 
@@ -80,6 +84,9 @@ tests/interop/run.sh all
 Artifacts are written under `tests/interop/artifacts/<case>/`.
 Each case also produces a `summary.txt` file with a coarse layer classification.
 Running the full matrix also writes `tests/interop/artifacts/report.md`.
+The summary includes both PeerCore-side flags and external peer readiness /
+connection flags, including whether the external peer observed or completed the
+test echo stream.
 
 ## Follow-up
 

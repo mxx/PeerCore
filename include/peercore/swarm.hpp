@@ -68,6 +68,7 @@ private:
     std::unordered_map<int, ConnectionId> fd_to_conn_;
     std::unordered_map<std::string, ConnectionId> peer_connections_;
     std::unordered_map<ConnectionId, std::string> connection_peers_;
+    std::unordered_map<uint64_t, StreamHandle> pending_streams_;
     std::unordered_set<int> listener_fds_;
     std::unordered_set<int> dialing_fds_;
     std::vector<std::shared_ptr<ProtocolHandler>> handlers_;
@@ -78,6 +79,9 @@ private:
     void dispatch_event(SwarmEvent event);
     void apply_action(const Action& action);
     ProtocolHandler* find_handler(const ProtocolId& proto);
+    std::vector<ProtocolId> supported_protocols() const;
+    uint64_t stream_key(ConnectionId conn_id, StreamId stream_id) const;
+    void poll_pending_streams();
     void sync_transport_fds();
     void register_connection(ConnectionId id, int fd);
     void drain_connection_events();
