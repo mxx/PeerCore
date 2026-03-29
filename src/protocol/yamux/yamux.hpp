@@ -56,12 +56,15 @@ public:
 
     void set_protocol(ProtocolId proto);
     void close_local_write();
+    bool read_closed() const;
+    bool write_closed() const;
 
 private:
     StreamId     id_;
     ConnectionId conn_id_;
-    bool         open_{true};
+    bool         read_closed_{false};
     bool         write_closed_{false};
+    bool         reset_{false};
     WriteCallback write_cb_;
     CloseCallback close_write_cb_;
     CloseCallback reset_cb_;
@@ -75,6 +78,7 @@ class YamuxSession {
 public:
     using AcceptCallback = std::function<void(std::shared_ptr<YamuxStream>)>;
     using OutgoingCallback = std::function<Result<void>()>;
+    using CloseCallback = std::function<void(StreamId, std::string)>;
 
     explicit YamuxSession(ConnectionId conn_id, bool is_client);
 
@@ -90,6 +94,7 @@ public:
     // Set callback for inbound streams (server side)
     void set_accept_callback(AcceptCallback cb);
     void set_outgoing_callback(OutgoingCallback cb);
+    void set_close_callback(CloseCallback cb);
 
 private:
     ConnectionId conn_id_;
@@ -100,6 +105,7 @@ private:
     std::vector<uint8_t>  send_buf_;   // pending outgoing bytes
     AcceptCallback        accept_cb_;
     OutgoingCallback      outgoing_cb_;
+    CloseCallback         close_cb_;
 
     std::shared_ptr<YamuxStream> get_or_create_stream(StreamId sid, bool open_if_missing);
     Result<void> write_stream_data(StreamId sid, ConstBytes data);

@@ -58,7 +58,8 @@ ConnectionId YamuxStream::connection_id() const { return conn_id_; }
 
 Result<size_t> YamuxStream::try_read(MutableBytes buf) {
     if (recv_buf_.empty()) {
-        return open_ ? Result<size_t>::err("EAGAIN") : Result<size_t>::ok(0);
+        return (read_closed_ || reset_) ? Result<size_t>::ok(0)
+                                        : Result<size_t>::err("EAGAIN");
     }
 
     const size_t n = std::min(buf.size(), recv_buf_.size());
@@ -70,7 +71,7 @@ Result<size_t> YamuxStream::try_read(MutableBytes buf) {
 }
 
 Result<size_t> YamuxStream::try_write(ConstBytes data) {
-    if (!open_ || write_closed_) {
+    if (write_closed_ || reset_) {
         return Result<size_t>::err("stream is closed for writing");
     }
     auto queued = write_cb_(id_, data);
@@ -85,14 +86,16 @@ Result<void> YamuxStream::close_write() {
 }
 
 Result<void> YamuxStream::reset() {
-    open_ = false;
+    read_closed_ = true;
     write_closed_ = true;
+    reset_ = true;
     recv_buf_.clear();
     return reset_cb_(id_);
 }
 
 bool YamuxStream::is_open() const {
-    return open_ || !recv_buf_.empty();
+    if (reset_) return false;
+    return !read_closed_ || !write_closed_ || !recv_buf_.empty();
 }
 
 std::optional<ProtocolId> YamuxStream::negotiated_protocol() const {
@@ -104,12 +107,13 @@ void YamuxStream::receive_data(std::vector<uint8_t> data) {
 }
 
 void YamuxStream::receive_fin() {
-    open_ = false;
+    read_closed_ = true;
 }
 
 void YamuxStream::receive_rst() {
-    open_ = false;
+    read_closed_ = true;
     write_closed_ = true;
+    reset_ = true;
     recv_buf_.clear();
 }
 
@@ -119,6 +123,14 @@ void YamuxStream::set_protocol(ProtocolId proto) {
 
 void YamuxStream::close_local_write() {
     write_closed_ = true;
+}
+
+bool YamuxStream::read_closed() const {
+    return read_closed_ || reset_;
+}
+
+bool YamuxStream::write_closed() const {
+    return write_closed_ || reset_;
 }
 
 YamuxSession::YamuxSession(ConnectionId conn_id, bool is_client)
@@ -162,6 +174,10 @@ void YamuxSession::set_accept_callback(AcceptCallback cb) {
 
 void YamuxSession::set_outgoing_callback(OutgoingCallback cb) {
     outgoing_cb_ = std::move(cb);
+}
+
+void YamuxSession::set_close_callback(CloseCallback cb) {
+    close_cb_ = std::move(cb);
 }
 
 std::shared_ptr<YamuxStream> YamuxSession::get_or_create_stream(StreamId sid,
@@ -276,9 +292,15 @@ void YamuxSession::handle_frame(const YamuxHeader& hdr,
     }
     if (has_flag(hdr.flags, YamuxFlag::FIN)) {
         stream->receive_fin();
+        if (close_cb_ && !stream->is_open()) {
+            close_cb_(hdr.stream_id, "yamux stream closed");
+        }
     }
     if (has_flag(hdr.flags, YamuxFlag::RST)) {
         stream->receive_rst();
+        if (close_cb_) {
+            close_cb_(hdr.stream_id, "yamux stream reset by peer");
+        }
         streams_.erase(hdr.stream_id);
     }
 }

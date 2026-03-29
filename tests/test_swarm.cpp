@@ -163,3 +163,77 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     EXPECT_TRUE(client_muxers_observed);
     EXPECT_TRUE(client_stream_opened);
 }
+
+TEST(Swarm, PropagatesYamuxResetAsStreamClosedEvent) {
+    ASSERT_GE(::sodium_init(), 0);
+    PeerStore server_store;
+    PeerStore client_store;
+    auto server_identity = make_identity();
+    auto client_identity = make_identity();
+    Swarm server(server_store, server_identity, {"/yamux/1.0.0"});
+    Swarm client(client_store, client_identity, {"/yamux/1.0.0"});
+
+    ASSERT_TRUE(server.start().is_ok());
+    ASSERT_TRUE(client.start().is_ok());
+
+    auto listen_res = server.listen_on(Multiaddr("/ip4/127.0.0.1/tcp/0"));
+    if (listen_res.is_err() &&
+        listen_res.error_message().find("Operation not permitted") != std::string::npos) {
+        GTEST_SKIP() << listen_res.error_message();
+    }
+    ASSERT_TRUE(listen_res.is_ok()) << listen_res.error_message();
+
+    auto listen_events = drain_events(server);
+    ASSERT_FALSE(listen_events.empty());
+    ASSERT_EQ(listen_events.front().type, SwarmEvent::Type::ListenerStarted);
+
+    ASSERT_TRUE(client.dial_addr(Multiaddr::from_ip4_tcp(
+        "127.0.0.1",
+        static_cast<uint16_t>(std::stoi(
+            listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
+        kTestPeerId)).is_ok());
+
+    bool connected = false;
+    std::optional<StreamHandle> client_stream;
+    bool server_stream_accepted = false;
+    bool server_stream_closed = false;
+
+    for (int i = 0; i < 120; ++i) {
+        server.poll_once();
+        client.poll_once();
+
+        for (auto& ev : drain_events(client)) {
+            if (ev.type == SwarmEvent::Type::ConnectionEstablished &&
+                ev.peer_id == std::optional<PeerId>(server_identity.peer_id)) {
+                connected = true;
+            }
+        }
+        for (auto& ev : drain_events(server)) {
+            if (ev.type == SwarmEvent::Type::StreamAccepted) {
+                server_stream_accepted = true;
+            }
+            if (ev.type == SwarmEvent::Type::StreamClosed &&
+                ev.detail == "yamux stream reset by peer") {
+                server_stream_closed = true;
+            }
+        }
+
+        if (connected && !client_stream.has_value()) {
+            auto stream_res = client.open_stream(server_identity.peer_id, "/test/1.0.0");
+            ASSERT_TRUE(stream_res.is_ok()) << stream_res.error().message;
+            client_stream = stream_res.value();
+        }
+
+        if (server_stream_accepted && client_stream.has_value()) {
+            ASSERT_TRUE((*client_stream)->reset().is_ok());
+            client_stream.reset();
+        }
+
+        if (server_stream_closed) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    EXPECT_TRUE(connected);
+    EXPECT_TRUE(server_stream_accepted);
+    EXPECT_TRUE(server_stream_closed);
+}

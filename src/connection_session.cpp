@@ -709,6 +709,13 @@ private:
         yamux_session_->set_outgoing_callback([this]() {
             return flush_yamux_outgoing();
         });
+        yamux_session_->set_close_callback([this](StreamId stream_id, std::string detail) {
+            event_queue_.push_back(ConnectionEvent{
+                .type = ConnectionEvent::Type::StreamClosed,
+                .stream_id = stream_id,
+                .detail = std::move(detail),
+            });
+        });
         create_inbound_stream_on_ready_ = false;
     }
 

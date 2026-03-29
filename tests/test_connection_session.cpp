@@ -292,6 +292,131 @@ TEST(ConnectionSession, MultiplexesMultipleStreamsWhenYamuxIsNegotiated) {
     sockets.peer = -1;
 }
 
+TEST(ConnectionSession, YamuxCloseWritePreservesReverseDirection) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7,
+        sockets.local,
+        Multiaddr("/ip4/127.0.0.1/tcp/4001"),
+        outbound_identity,
+        {"/yamux/1.0.0"});
+    auto inbound = make_inbound_connection_session(
+        8,
+        sockets.peer,
+        Multiaddr("/ip4/127.0.0.1/tcp/4002"),
+        inbound_identity,
+        {"/yamux/1.0.0"});
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
+
+    ASSERT_EQ(outbound->state(), ConnectionState::Ready);
+    ASSERT_EQ(inbound->state(), ConnectionState::Ready);
+    drain_events(*outbound);
+    drain_events(*inbound);
+
+    auto outbound_stream_res = outbound->request_open_stream("/test/1.0.0");
+    ASSERT_TRUE(outbound_stream_res.is_ok());
+    drive_sessions(*outbound, *inbound, 16);
+
+    auto inbound_stream = inbound->accept_inbound_stream();
+    ASSERT_TRUE(inbound_stream.has_value());
+
+    ASSERT_TRUE(outbound_stream_res.value()->close_write().is_ok());
+    drive_sessions(*outbound, *inbound, 16);
+
+    std::array<uint8_t, 8> read_buf{};
+    auto eof_read = (*inbound_stream)->try_read(read_buf);
+    ASSERT_TRUE(eof_read.is_ok());
+    EXPECT_EQ(eof_read.value(), 0u);
+
+    const std::array<uint8_t, 4> pong{{'p', 'o', 'n', 'g'}};
+    auto write_pong = (*inbound_stream)->try_write(pong);
+    ASSERT_TRUE(write_pong.is_ok());
+    drive_sessions(*outbound, *inbound, 16);
+
+    read_buf.fill(0);
+    auto read_pong = outbound_stream_res.value()->try_read(read_buf);
+    ASSERT_TRUE(read_pong.is_ok());
+    EXPECT_EQ(read_pong.value(), pong.size());
+    EXPECT_EQ(std::string(reinterpret_cast<const char*>(read_buf.data()), read_pong.value()), "pong");
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
+TEST(ConnectionSession, YamuxResetClosesPeerStreamAndEmitsEvent) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7,
+        sockets.local,
+        Multiaddr("/ip4/127.0.0.1/tcp/4001"),
+        outbound_identity,
+        {"/yamux/1.0.0"});
+    auto inbound = make_inbound_connection_session(
+        8,
+        sockets.peer,
+        Multiaddr("/ip4/127.0.0.1/tcp/4002"),
+        inbound_identity,
+        {"/yamux/1.0.0"});
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
+
+    ASSERT_EQ(outbound->state(), ConnectionState::Ready);
+    ASSERT_EQ(inbound->state(), ConnectionState::Ready);
+    drain_events(*outbound);
+    drain_events(*inbound);
+
+    auto outbound_stream_res = outbound->request_open_stream("/test/1.0.0");
+    ASSERT_TRUE(outbound_stream_res.is_ok());
+    drive_sessions(*outbound, *inbound, 16);
+
+    auto inbound_stream = inbound->accept_inbound_stream();
+    ASSERT_TRUE(inbound_stream.has_value());
+    drain_events(*inbound);
+
+    ASSERT_TRUE(outbound_stream_res.value()->reset().is_ok());
+    drive_sessions(*outbound, *inbound, 16);
+
+    std::array<uint8_t, 8> read_buf{};
+    auto eof_read = (*inbound_stream)->try_read(read_buf);
+    ASSERT_TRUE(eof_read.is_ok());
+    EXPECT_EQ(eof_read.value(), 0u);
+
+    auto write_after_reset = (*inbound_stream)->try_write(std::array<uint8_t, 1>{'x'});
+    ASSERT_TRUE(write_after_reset.is_err());
+    EXPECT_EQ(write_after_reset.error().message, "stream is closed for writing");
+
+    auto inbound_events = drain_events(*inbound);
+    ASSERT_FALSE(inbound_events.empty());
+    EXPECT_EQ(inbound_events.back().type, ConnectionEvent::Type::StreamClosed);
+    EXPECT_EQ(inbound_events.back().detail, "yamux stream reset by peer");
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
 TEST(ConnectionSession, RejectsStreamOpenBeforeHandshakeCompletes) {
     ASSERT_GE(::sodium_init(), 0);
     SocketPair sockets;
