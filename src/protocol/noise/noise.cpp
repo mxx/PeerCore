@@ -626,6 +626,9 @@ Result<std::vector<uint8_t>> NoiseHandshake::encrypt(CipherState& cs,
     if (!cs.has_key) {
         return Result<std::vector<uint8_t>>::err("noise cipher state is not initialized");
     }
+    if (cs.nonce == std::numeric_limits<uint64_t>::max()) {
+        return Result<std::vector<uint8_t>>::err("noise nonce exhausted");
+    }
 
     auto ciphertext = encrypt_with_key(cs.key, cs.nonce, plaintext, ConstBytes{});
     if (ciphertext.is_err()) return ciphertext;
@@ -642,6 +645,9 @@ Result<std::vector<uint8_t>> NoiseHandshake::decrypt(CipherState& cs,
     }
     if (!cs.has_key) {
         return Result<std::vector<uint8_t>>::err("noise cipher state is not initialized");
+    }
+    if (cs.nonce == std::numeric_limits<uint64_t>::max()) {
+        return Result<std::vector<uint8_t>>::err("noise nonce exhausted");
     }
 
     auto plaintext = decrypt_with_key(cs.key, cs.nonce, ciphertext, ConstBytes{});
