@@ -15,4 +15,7 @@ PAYLOAD_HEX="${2:-}"
 docker compose -f "$COMPOSE_FILE" run --rm \
   -e MSG1_HEX="$MSG1_HEX" \
   -e PAYLOAD_HEX="$PAYLOAD_HEX" \
+  -e STATIC_SECRET_HEX="${STATIC_SECRET_HEX:-}" \
+  -e EPHEMERAL_SECRET_HEX="${EPHEMERAL_SECRET_HEX:-}" \
+  -e PROLOGUE_HEX="${PROLOGUE_HEX:-}" \
   go-noise-oracle

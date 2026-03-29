@@ -95,6 +95,9 @@ tests/interop/oracle.sh <msg1-hex>
 The oracle prints a single JSON object containing the responder's `msg2`,
 its fixed local public keys, and the echoed remote ephemeral key. This is
 useful when narrowing a Noise mismatch to a specific handshake token.
+`STATIC_SECRET_HEX`, `EPHEMERAL_SECRET_HEX`, `PROLOGUE_HEX`, and `PAYLOAD_HEX`
+can be provided through the environment when you need deterministic alternate
+vectors.
 
 Artifacts are written under `tests/interop/artifacts/<case>/`.
 Each case also produces a `summary.txt` file with a coarse layer classification.
