@@ -1,0 +1,14 @@
+FROM golang:1.25-bookworm AS build
+
+WORKDIR /app
+# Copy go.mod and original main.go first — reuses the oracle's cached "go mod tidy" layer
+COPY tests/interop/go-noise-oracle/go.mod /app/go.mod
+COPY tests/interop/go-noise-oracle/main.go /app/main.go
+RUN go mod tidy
+# Now replace main.go with the trace binary (after modules are already cached)
+COPY tests/interop/go-noise-oracle/trace_main.go /app/main.go
+RUN GOPROXY=off go build -o /usr/local/bin/go-noise-trace .
+
+FROM debian:bookworm-slim
+COPY --from=build /usr/local/bin/go-noise-trace /usr/local/bin/go-noise-trace
+ENTRYPOINT ["/usr/local/bin/go-noise-trace"]

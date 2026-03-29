@@ -437,6 +437,9 @@ std::vector<uint8_t> NoiseHandshake::write_msg1(NoiseSession& session) {
     std::vector<uint8_t> out(session.ephemeral.public_key.begin(),
                              session.ephemeral.public_key.end());
     mix_hash(session, out);
+    auto payload = encrypt_and_hash(session, ConstBytes{});
+    if (payload.is_err()) return {};
+    out.insert(out.end(), payload.value().begin(), payload.value().end());
     return out;
 }
 
@@ -446,7 +449,7 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
     if (sodium_ready.is_err()) {
         return Result<std::vector<uint8_t>>::err(sodium_ready.error_message());
     }
-    if (msg1.size() != 32) {
+    if (msg1.size() < 32) {
         return Result<std::vector<uint8_t>>::err("invalid msg1 size");
     }
     session.is_initiator = false;
@@ -456,7 +459,14 @@ Result<std::vector<uint8_t>> NoiseHandshake::process_msg1(NoiseSession& session,
     }
     std::copy_n(msg1.begin(), 32, session.remote_ephemeral_pub.begin());
     session.has_remote_ephemeral = true;
-    mix_hash(session, msg1);
+    mix_hash(session, msg1.subspan(0, 32));
+
+    ConstBytes remote_payload_bytes(msg1.data() + 32, msg1.size() - 32);
+    auto remote_payload = decrypt_and_hash(session, remote_payload_bytes);
+    if (remote_payload.is_err()) {
+        return Result<std::vector<uint8_t>>::err("noise msg1 payload decrypt failed: " +
+                                                 remote_payload.error().message);
+    }
 
     session.ephemeral = take_or_generate_keypair(session.configured_ephemeral);
     session.static_key = take_or_generate_keypair(session.configured_static);

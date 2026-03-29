@@ -67,7 +67,11 @@ int main(int argc, char** argv) {
     }
 
     bool generate_msg1 = false;
+    std::optional<std::string> msg1_hex;
     std::optional<std::string> msg2_hex;
+    std::optional<std::string> aead_probe_key_hex;
+    std::optional<std::string> aead_probe_ad_hex;
+    std::optional<std::string> aead_probe_pt_hex;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -75,8 +79,18 @@ int main(int argc, char** argv) {
             generate_msg1 = true;
             continue;
         }
+        if (arg == "--process-msg1" && i + 1 < argc) {
+            msg1_hex = argv[++i];
+            continue;
+        }
         if (arg == "--process-msg2" && i + 1 < argc) {
             msg2_hex = argv[++i];
+            continue;
+        }
+        if (arg == "--aead-probe" && i + 3 < argc) {
+            aead_probe_key_hex = argv[++i];
+            aead_probe_ad_hex = argv[++i];
+            aead_probe_pt_hex = argv[++i];
             continue;
         }
     }
@@ -95,6 +109,70 @@ int main(int argc, char** argv) {
             {"msg1_hex", encode_hex(msg1)},
             {"ephemeral_pub_hex", encode_hex(initiator.ephemeral.public_key)},
             {"static_pub_hex", encode_hex(initiator.static_key.public_key)},
+        });
+        return 0;
+    }
+
+    if (aead_probe_key_hex.has_value()) {
+        auto key = decode_hex(*aead_probe_key_hex);
+        auto ad = decode_hex(*aead_probe_ad_hex);
+        auto pt = decode_hex(*aead_probe_pt_hex);
+        if (!key.has_value() || key->size() != 32 || !ad.has_value() || !pt.has_value()) {
+            std::cerr << "invalid aead probe hex inputs\n";
+            return 2;
+        }
+
+        std::array<unsigned char, crypto_aead_chacha20poly1305_ietf_NPUBBYTES> nonce{};
+        std::vector<uint8_t> ciphertext(
+            pt->size() + crypto_aead_chacha20poly1305_ietf_ABYTES);
+        unsigned long long out_len = 0;
+        if (::crypto_aead_chacha20poly1305_ietf_encrypt(ciphertext.data(),
+                                                        &out_len,
+                                                        pt->data(),
+                                                        pt->size(),
+                                                        ad->data(),
+                                                        ad->size(),
+                                                        nullptr,
+                                                        nonce.data(),
+                                                        key->data()) != 0) {
+            std::cerr << "aead encrypt failed\n";
+            return 3;
+        }
+        ciphertext.resize(static_cast<size_t>(out_len));
+        print_json("aead_probe", {
+            {"key_hex", *aead_probe_key_hex},
+            {"ad_hex", *aead_probe_ad_hex},
+            {"pt_hex", *aead_probe_pt_hex},
+            {"ct_hex", encode_hex(ciphertext)},
+        });
+        return 0;
+    }
+
+    if (msg1_hex.has_value()) {
+        auto decoded = decode_hex(*msg1_hex);
+        if (!decoded.has_value()) {
+            std::cerr << "invalid msg1 hex\n";
+            return 2;
+        }
+
+        NoiseSession responder;
+        responder.configured_ephemeral = keypair_from_secret_hex(std::getenv("RESP_EPHEMERAL_SECRET_HEX"));
+        responder.configured_static = keypair_from_secret_hex(std::getenv("RESP_STATIC_SECRET_HEX"));
+
+        auto msg2 = NoiseHandshake::process_msg1(responder, *decoded);
+        if (msg2.is_err()) {
+            print_json("process_msg1_error", {
+                {"detail", msg2.error().message},
+                {"msg1_hex", *msg1_hex},
+            });
+            return 3;
+        }
+
+        print_json("process_msg1_ok", {
+            {"msg1_hex", *msg1_hex},
+            {"msg2_hex", encode_hex(msg2.value())},
+            {"ephemeral_pub_hex", encode_hex(responder.ephemeral.public_key)},
+            {"static_pub_hex", encode_hex(responder.static_key.public_key)},
         });
         return 0;
     }
@@ -126,6 +204,6 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    std::cerr << "usage: interop_noise_trace --generate-msg1 | --process-msg2 <hex>\n";
+    std::cerr << "usage: interop_noise_trace --generate-msg1 | --process-msg1 <hex> | --process-msg2 <hex> | --aead-probe <key-hex> <ad-hex> <pt-hex>\n";
     return 2;
 }
