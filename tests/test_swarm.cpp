@@ -68,8 +68,8 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     PeerStore client_store;
     auto server_identity = make_identity();
     auto client_identity = make_identity();
-    Swarm server(server_store, server_identity);
-    Swarm client(client_store, client_identity);
+    Swarm server(server_store, server_identity, {"/mplex/6.7.0", "/yamux/1.0.0"});
+    Swarm client(client_store, client_identity, {"/yamux/1.0.0"});
 
     ASSERT_TRUE(server.start().is_ok());
     ASSERT_TRUE(client.start().is_ok());
@@ -97,6 +97,8 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     bool client_established = false;
     bool server_identified = false;
     bool client_identified = false;
+    bool server_muxers_observed = false;
+    bool client_muxers_observed = false;
     bool client_stream_opened = false;
     bool stream_open_requested = false;
 
@@ -114,6 +116,11 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
                 ev.peer_id == std::optional<PeerId>(client_identity.peer_id)) {
                 server_established = true;
             }
+            if (ev.type == SwarmEvent::Type::ProtocolNegotiated &&
+                ev.peer_id == std::optional<PeerId>(client_identity.peer_id) &&
+                ev.detail == "/yamux/1.0.0") {
+                server_muxers_observed = true;
+            }
         }
         for (auto& ev : drain_events(client)) {
             if (ev.type == SwarmEvent::Type::PeerIdentified &&
@@ -127,6 +134,11 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
             if (ev.type == SwarmEvent::Type::StreamOpened) {
                 client_stream_opened = true;
             }
+            if (ev.type == SwarmEvent::Type::ProtocolNegotiated &&
+                ev.peer_id == std::optional<PeerId>(server_identity.peer_id) &&
+                ev.detail == "/mplex/6.7.0, /yamux/1.0.0") {
+                client_muxers_observed = true;
+            }
         }
 
         if (!stream_open_requested && client_established) {
@@ -136,7 +148,9 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
         }
 
         if (server_incoming && server_established && client_established &&
-            server_identified && client_identified && client_stream_opened) break;
+            server_identified && client_identified &&
+            server_muxers_observed && client_muxers_observed &&
+            client_stream_opened) break;
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
@@ -145,5 +159,7 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
     EXPECT_TRUE(server_established);
     EXPECT_TRUE(client_identified);
     EXPECT_TRUE(client_established);
+    EXPECT_TRUE(server_muxers_observed);
+    EXPECT_TRUE(client_muxers_observed);
     EXPECT_TRUE(client_stream_opened);
 }

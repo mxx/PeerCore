@@ -14,11 +14,23 @@ std::string dial_failed_detail(const Multiaddr& addr, const std::string& detail)
     return addr.to_string() + ": " + detail;
 }
 
+std::string join_protocols(const std::vector<ProtocolId>& protocols) {
+    std::string out;
+    for (size_t i = 0; i < protocols.size(); ++i) {
+        if (i > 0) out += ", ";
+        out += protocols[i];
+    }
+    return out;
+}
+
 }  // namespace
 
-Swarm::Swarm(PeerStore& peer_store, std::optional<Identity> local_identity)
+Swarm::Swarm(PeerStore& peer_store,
+             std::optional<Identity> local_identity,
+             std::vector<ProtocolId> local_stream_muxers)
     : peer_store_(peer_store)
     , local_identity_(std::move(local_identity))
+    , local_stream_muxers_(std::move(local_stream_muxers))
     , controller_(std::make_shared<DefaultController>())
     , event_loop_(std::make_unique<runtime::EventLoop>())
     , transport_(std::make_unique<transport::TcpTransport>()) {}
@@ -70,7 +82,7 @@ Result<void> Swarm::listen_on(const Multiaddr& addr) {
             .on_accepted = [this](transport::TcpSocket socket) {
                 const ConnectionId id = next_conn_id_++;
                 auto session = make_inbound_connection_session(
-                    id, socket.fd, socket.remote_addr, local_identity_);
+                    id, socket.fd, socket.remote_addr, local_identity_, local_stream_muxers_);
                 connections_[id] = std::move(session);
                 register_connection(id, socket.fd);
 
@@ -132,7 +144,7 @@ Result<void> Swarm::dial_addr(const Multiaddr& addr) {
             .on_connected = [this](transport::TcpSocket socket) {
                 const ConnectionId id = next_conn_id_++;
                 auto session = make_outbound_connection_session(
-                    id, socket.fd, socket.remote_addr, local_identity_);
+                    id, socket.fd, socket.remote_addr, local_identity_, local_stream_muxers_);
                 connections_[id] = std::move(session);
                 register_connection(id, socket.fd);
 
@@ -391,6 +403,16 @@ void Swarm::handle_connection_event(ConnectionId id,
                     .peer_id = it->second->remote_peer(),
                     .detail = event.detail,
                 });
+                const auto remote_muxers = it->second->remote_stream_muxers();
+                if (!remote_muxers.empty()) {
+                    dispatch_event(SwarmEvent{
+                        .type = SwarmEvent::Type::ProtocolNegotiated,
+                        .connection_id = id,
+                        .stream_id = std::nullopt,
+                        .peer_id = it->second->remote_peer(),
+                        .detail = join_protocols(remote_muxers),
+                    });
+                }
             }
             break;
         case ConnectionEvent::Type::MultiplexerReady:

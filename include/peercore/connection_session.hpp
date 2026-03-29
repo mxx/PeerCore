@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 
 namespace peercore {
 
@@ -28,6 +29,7 @@ public:
     virtual ConnectionId    id()          const = 0;
     virtual ConnectionState state()       const = 0;
     virtual std::optional<PeerId> remote_peer() const = 0;
+    virtual std::vector<ProtocolId> remote_stream_muxers() const = 0;
 
     // Socket readiness callbacks (called by the event loop)
     virtual void on_socket_readable() = 0;
@@ -52,12 +54,14 @@ std::unique_ptr<ConnectionSession> make_outbound_connection_session(
     ConnectionId id,
     int socket_fd,
     Multiaddr remote_addr,
-    std::optional<Identity> local_identity = std::nullopt);
+    std::optional<Identity> local_identity = std::nullopt,
+    std::vector<ProtocolId> local_stream_muxers = {});
 
 std::unique_ptr<ConnectionSession> make_inbound_connection_session(
     ConnectionId id,
     int socket_fd,
     Multiaddr remote_addr,
-    std::optional<Identity> local_identity = std::nullopt);
+    std::optional<Identity> local_identity = std::nullopt,
+    std::vector<ProtocolId> local_stream_muxers = {});
 
 }  // namespace peercore

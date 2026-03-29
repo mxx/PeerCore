@@ -80,9 +80,17 @@ TEST(ConnectionSession, RunsNoiseHandshakeBeforeReady) {
     auto outbound_identity = make_identity();
     auto inbound_identity = make_identity();
     auto outbound = make_outbound_connection_session(
-        7, sockets.local, Multiaddr("/ip4/127.0.0.1/tcp/4001"), outbound_identity);
+        7,
+        sockets.local,
+        Multiaddr("/ip4/127.0.0.1/tcp/4001"),
+        outbound_identity,
+        {"/yamux/1.0.0"});
     auto inbound = make_inbound_connection_session(
-        8, sockets.peer, Multiaddr("/ip4/127.0.0.1/tcp/4002"), inbound_identity);
+        8,
+        sockets.peer,
+        Multiaddr("/ip4/127.0.0.1/tcp/4002"),
+        inbound_identity,
+        {"/mplex/6.7.0", "/yamux/1.0.0"});
 
     ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
     ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
@@ -104,6 +112,10 @@ TEST(ConnectionSession, RunsNoiseHandshakeBeforeReady) {
     ASSERT_TRUE(inbound->remote_peer().has_value());
     EXPECT_EQ(*outbound->remote_peer(), inbound_identity.peer_id);
     EXPECT_EQ(*inbound->remote_peer(), outbound_identity.peer_id);
+    EXPECT_EQ(outbound->remote_stream_muxers(),
+              (std::vector<ProtocolId>{"/mplex/6.7.0", "/yamux/1.0.0"}));
+    EXPECT_EQ(inbound->remote_stream_muxers(),
+              (std::vector<ProtocolId>{"/yamux/1.0.0"}));
 
     auto outbound_events = drain_events(*outbound);
     ASSERT_GE(outbound_events.size(), 2u);

@@ -284,7 +284,8 @@ public:
                            int socket_fd,
                            Multiaddr remote_addr,
                            bool is_initiator,
-                           std::optional<Identity> local_identity)
+                           std::optional<Identity> local_identity,
+                           std::vector<ProtocolId> local_stream_muxers)
         : id_(id)
         , state_(ConnectionState::TcpAccepted)
         , remote_addr_(std::move(remote_addr))
@@ -292,6 +293,7 @@ public:
         , secure_(std::make_shared<SecureChannelState>())
         , is_initiator_(is_initiator) {
         secure_->noise.local_identity = std::move(local_identity);
+        secure_->noise.local_extensions.stream_muxers = std::move(local_stream_muxers);
     }
 
     ~BasicConnectionSession() override { close(); }
@@ -299,6 +301,9 @@ public:
     ConnectionId id() const override { return id_; }
     ConnectionState state() const override { return state_; }
     std::optional<PeerId> remote_peer() const override { return secure_->noise.remote_peer_id; }
+    std::vector<ProtocolId> remote_stream_muxers() const override {
+        return secure_->noise.remote_extensions.stream_muxers;
+    }
 
     void on_socket_readable() override {
         if (!is_active()) return;
@@ -688,18 +693,30 @@ std::unique_ptr<ConnectionSession> make_outbound_connection_session(
     ConnectionId id,
     int socket_fd,
     Multiaddr remote_addr,
-    std::optional<Identity> local_identity) {
+    std::optional<Identity> local_identity,
+    std::vector<ProtocolId> local_stream_muxers) {
     return std::make_unique<BasicConnectionSession>(
-        id, socket_fd, std::move(remote_addr), true, std::move(local_identity));
+        id,
+        socket_fd,
+        std::move(remote_addr),
+        true,
+        std::move(local_identity),
+        std::move(local_stream_muxers));
 }
 
 std::unique_ptr<ConnectionSession> make_inbound_connection_session(
     ConnectionId id,
     int socket_fd,
     Multiaddr remote_addr,
-    std::optional<Identity> local_identity) {
+    std::optional<Identity> local_identity,
+    std::vector<ProtocolId> local_stream_muxers) {
     return std::make_unique<BasicConnectionSession>(
-        id, socket_fd, std::move(remote_addr), false, std::move(local_identity));
+        id,
+        socket_fd,
+        std::move(remote_addr),
+        false,
+        std::move(local_identity),
+        std::move(local_stream_muxers));
 }
 
 }  // namespace peercore

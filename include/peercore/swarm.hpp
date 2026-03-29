@@ -25,7 +25,9 @@ class TcpTransport;
 
 class Swarm {
 public:
-    explicit Swarm(PeerStore& peer_store, std::optional<Identity> local_identity = std::nullopt);
+    explicit Swarm(PeerStore& peer_store,
+                   std::optional<Identity> local_identity = std::nullopt,
+                   std::vector<ProtocolId> local_stream_muxers = {});
     ~Swarm();
 
     // Lifecycle
@@ -56,6 +58,7 @@ public:
 private:
     PeerStore& peer_store_;
     std::optional<Identity> local_identity_;
+    std::vector<ProtocolId> local_stream_muxers_;
     std::shared_ptr<Controller> controller_;
     std::unique_ptr<runtime::EventLoop> event_loop_;
     std::unique_ptr<transport::TcpTransport> transport_;
