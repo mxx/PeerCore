@@ -410,7 +410,8 @@ NoiseKeypair NoiseHandshake::generate_keypair() {
     NoiseKeypair kp;
     auto sodium_ready = ensure_sodium_ready();
     (void)sodium_ready;
-    ::crypto_box_keypair(kp.public_key.data(), kp.secret_key.data());
+    ::randombytes_buf(kp.secret_key.data(), kp.secret_key.size());
+    ::crypto_scalarmult_curve25519_base(kp.public_key.data(), kp.secret_key.data());
     return kp;
 }
 
