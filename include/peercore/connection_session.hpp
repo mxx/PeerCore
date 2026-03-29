@@ -30,6 +30,7 @@ public:
     virtual ConnectionState state()       const = 0;
     virtual std::optional<PeerId> remote_peer() const = 0;
     virtual std::vector<ProtocolId> remote_stream_muxers() const = 0;
+    virtual std::optional<ProtocolId> negotiated_stream_muxer() const = 0;
 
     // Socket readiness callbacks (called by the event loop)
     virtual void on_socket_readable() = 0;

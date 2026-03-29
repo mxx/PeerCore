@@ -136,7 +136,7 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
             }
             if (ev.type == SwarmEvent::Type::ProtocolNegotiated &&
                 ev.peer_id == std::optional<PeerId>(server_identity.peer_id) &&
-                ev.detail == "/mplex/6.7.0, /yamux/1.0.0") {
+                ev.detail == "/yamux/1.0.0") {
                 client_muxers_observed = true;
             }
         }

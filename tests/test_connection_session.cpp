@@ -116,16 +116,24 @@ TEST(ConnectionSession, RunsNoiseHandshakeBeforeReady) {
               (std::vector<ProtocolId>{"/mplex/6.7.0", "/yamux/1.0.0"}));
     EXPECT_EQ(inbound->remote_stream_muxers(),
               (std::vector<ProtocolId>{"/yamux/1.0.0"}));
+    EXPECT_EQ(outbound->negotiated_stream_muxer(),
+              std::optional<ProtocolId>("/yamux/1.0.0"));
+    EXPECT_EQ(inbound->negotiated_stream_muxer(),
+              std::optional<ProtocolId>("/yamux/1.0.0"));
 
     auto outbound_events = drain_events(*outbound);
     ASSERT_GE(outbound_events.size(), 2u);
     EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Secured);
     EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
+    EXPECT_EQ(outbound_events[1].detail,
+              "selected stream muxer hint: /yamux/1.0.0 (single-stream fallback)");
 
     auto inbound_events = drain_events(*inbound);
     ASSERT_GE(inbound_events.size(), 3u);
     EXPECT_EQ(inbound_events[0].type, ConnectionEvent::Type::Secured);
     EXPECT_EQ(inbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
+    EXPECT_EQ(inbound_events[1].detail,
+              "selected stream muxer hint: /yamux/1.0.0 (single-stream fallback)");
     EXPECT_EQ(inbound_events[2].type, ConnectionEvent::Type::StreamAccepted);
 
     sockets.local = -1;

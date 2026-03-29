@@ -14,15 +14,6 @@ std::string dial_failed_detail(const Multiaddr& addr, const std::string& detail)
     return addr.to_string() + ": " + detail;
 }
 
-std::string join_protocols(const std::vector<ProtocolId>& protocols) {
-    std::string out;
-    for (size_t i = 0; i < protocols.size(); ++i) {
-        if (i > 0) out += ", ";
-        out += protocols[i];
-    }
-    return out;
-}
-
 }  // namespace
 
 Swarm::Swarm(PeerStore& peer_store,
@@ -403,14 +394,14 @@ void Swarm::handle_connection_event(ConnectionId id,
                     .peer_id = it->second->remote_peer(),
                     .detail = event.detail,
                 });
-                const auto remote_muxers = it->second->remote_stream_muxers();
-                if (!remote_muxers.empty()) {
+                const auto negotiated_muxer = it->second->negotiated_stream_muxer();
+                if (negotiated_muxer.has_value()) {
                     dispatch_event(SwarmEvent{
                         .type = SwarmEvent::Type::ProtocolNegotiated,
                         .connection_id = id,
                         .stream_id = std::nullopt,
                         .peer_id = it->second->remote_peer(),
-                        .detail = join_protocols(remote_muxers),
+                        .detail = *negotiated_muxer,
                     });
                 }
             }

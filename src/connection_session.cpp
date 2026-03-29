@@ -47,6 +47,7 @@ struct SecureChannelState {
     NoiseSession   noise;
     SecurityStage  stage{SecurityStage::NegotiatingProtocol};
     HandshakeState handshake_state{HandshakeState::Idle};
+    std::optional<ProtocolId> negotiated_stream_muxer;
     bool            secure_ready{false};
 };
 
@@ -222,6 +223,22 @@ Result<size_t> queue_encrypted_write(StreamState& state, ConstBytes data) {
     return Result<size_t>::ok(data.size());
 }
 
+std::optional<ProtocolId> select_stream_muxer(const NoiseSession& noise) {
+    if (noise.local_extensions.stream_muxers.empty() ||
+        noise.remote_extensions.stream_muxers.empty()) {
+        return std::nullopt;
+    }
+
+    for (const auto& local : noise.local_extensions.stream_muxers) {
+        if (std::find(noise.remote_extensions.stream_muxers.begin(),
+                      noise.remote_extensions.stream_muxers.end(),
+                      local) != noise.remote_extensions.stream_muxers.end()) {
+            return local;
+        }
+    }
+    return std::nullopt;
+}
+
 class DirectMuxedStream final : public MuxedStream {
 public:
     explicit DirectMuxedStream(std::shared_ptr<StreamState> state)
@@ -303,6 +320,9 @@ public:
     std::optional<PeerId> remote_peer() const override { return secure_->noise.remote_peer_id; }
     std::vector<ProtocolId> remote_stream_muxers() const override {
         return secure_->noise.remote_extensions.stream_muxers;
+    }
+    std::optional<ProtocolId> negotiated_stream_muxer() const override {
+        return secure_->negotiated_stream_muxer;
     }
 
     void on_socket_readable() override {
@@ -610,6 +630,7 @@ private:
         auto expected_peer = validate_expected_remote_peer();
         if (expected_peer.is_err()) return expected_peer;
 
+        secure_->negotiated_stream_muxer = select_stream_muxer(secure_->noise);
         secure_->stage = SecurityStage::Ready;
         secure_->secure_ready = true;
         state_ = ConnectionState::SecureReady;
@@ -623,7 +644,11 @@ private:
         event_queue_.push_back(ConnectionEvent{
             .type = ConnectionEvent::Type::MultiplexerReady,
             .stream_id = std::nullopt,
-            .detail = "noise secure channel ready (single-stream fallback)",
+            .detail = secure_->negotiated_stream_muxer.has_value()
+                          ? "selected stream muxer hint: " +
+                                *secure_->negotiated_stream_muxer +
+                                " (single-stream fallback)"
+                          : "noise secure channel ready (single-stream fallback)",
         });
 
         state_ = ConnectionState::Ready;
