@@ -26,12 +26,17 @@ Current limitation:
   Container definitions for Go and Rust libp2p peers.
 - `go-peer/`
   Minimal go-libp2p peer container.
+- `go-noise-oracle/`
+  Deterministic Go helper that uses `flynn/noise` to generate authoritative
+  Noise XX handshake messages for offline comparison.
 - `rust-peer/`
   Minimal rust-libp2p peer container.
 - `run.sh`
   Runner for the outbound/inbound diagnostic matrix plus summary generation.
 - `report.sh`
   Aggregates per-case summaries into a single markdown report.
+- `oracle.sh`
+  Convenience wrapper for running the Go Noise oracle in Docker.
 
 ## Cases
 
@@ -80,6 +85,16 @@ Run the whole matrix:
 ```bash
 tests/interop/run.sh all
 ```
+
+Run the deterministic Go Noise oracle against a captured `msg1`:
+
+```bash
+tests/interop/oracle.sh <msg1-hex>
+```
+
+The oracle prints a single JSON object containing the responder's `msg2`,
+its fixed local public keys, and the echoed remote ephemeral key. This is
+useful when narrowing a Noise mismatch to a specific handshake token.
 
 Artifacts are written under `tests/interop/artifacts/<case>/`.
 Each case also produces a `summary.txt` file with a coarse layer classification.

@@ -12,6 +12,11 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
+  go-noise-oracle:
+    build:
+      context: ../../
+      dockerfile: tests/interop/go-noise-oracle/Dockerfile
+
   rust-peer:
     build:
       context: ../../
