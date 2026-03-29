@@ -29,7 +29,7 @@ Current limitation:
 - `rust-peer/`
   Minimal rust-libp2p peer container.
 - `run.sh`
-  Runner for a small outbound/inbound diagnostic matrix.
+  Runner for the outbound/inbound diagnostic matrix plus summary generation.
 
 ## Cases
 
@@ -69,7 +69,14 @@ Run one case:
 tests/interop/run.sh go-outbound
 ```
 
+Run the whole matrix:
+
+```bash
+tests/interop/run.sh all
+```
+
 Artifacts are written under `tests/interop/artifacts/<case>/`.
+Each case also produces a `summary.txt` file with a coarse layer classification.
 
 ## Follow-up
 
