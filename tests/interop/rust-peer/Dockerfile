@@ -1,4 +1,4 @@
-FROM rust:1.77-bookworm AS build
+FROM rust:1.85-bookworm AS build
 
 WORKDIR /app
 COPY tests/interop/rust-peer/Cargo.toml /app/Cargo.toml
