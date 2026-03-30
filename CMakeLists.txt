@@ -11,6 +11,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Build options
 option(PEERCORE_BUILD_TESTS    "Build tests"             ON)
 option(PEERCORE_COVERAGE       "Enable coverage reports" OFF)
+option(PEERCORE_ENABLE_NETWORK_SMOKE_TESTS "Enable opt-in listen/dial smoke tests" OFF)
 
 # Find dependencies
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")

@@ -1,0 +1,4 @@
+name: invalid client-side inbound stream id triggers go-away
+role: client
+input_hex: 000000010000000100000000
+expected_output_hex: 000300000000000000000001

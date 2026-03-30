@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ensure_probe_bin() {
+  if [[ ! -x "${PROBE_BIN:-}" ]]; then
+    echo "missing ${PROBE_BIN:-<unset>}; build it with: cmake --build build --target interop_peercore_probe" >&2
+    exit 2
+  fi
+}
+
+run_probe() {
+  "${PROBE_BIN}" "$@" | tee "${ARTIFACT_DIR}/peercore.jsonl"
+}
+
+run_probe_background() {
+  "${PROBE_BIN}" "$@" >"${ARTIFACT_DIR}/peercore.jsonl" 2>&1 &
+  PROBE_PID=$!
+}
+
+wait_for_probe_addr() {
+  local timeout_secs="${1:-10}"
+  local peer_id=""
+  local listen_addr=""
+  for _ in $(seq 1 $((timeout_secs * 10))); do
+    if [[ -f "${ARTIFACT_DIR}/peercore.jsonl" ]]; then
+      peer_id="$(sed -n 's/.*"type":"probe_started".*"detail":"\([^"]*\)".*/\1/p' "${ARTIFACT_DIR}/peercore.jsonl" | tail -n1)"
+      listen_addr="$(sed -n 's/.*"type":"listener_started".*"detail":"\([^"]*\)".*/\1/p' "${ARTIFACT_DIR}/peercore.jsonl" | tail -n1)"
+      if [[ -n "${peer_id}" && -n "${listen_addr}" ]]; then
+        echo "${listen_addr}/p2p/${peer_id}"
+        return 0
+      fi
+    fi
+    sleep 0.1
+  done
+  echo "failed to discover probe listen address" >&2
+  return 1
+}
+
+wait_for_json_event() {
+  local log_file="$1"
+  local event_name="$2"
+  local timeout_secs="${3:-10}"
+  local pid="${4:-}"
+  for _ in $(seq 1 $((timeout_secs * 10))); do
+    if [[ -f "${log_file}" ]] && grep -q "\"type\":\"${event_name}\"" "${log_file}"; then
+      return 0
+    fi
+    if [[ -n "${pid}" ]] && ! kill -0 "${pid}" 2>/dev/null; then
+      echo "process ${pid} exited before emitting ${event_name}; see ${log_file}" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  echo "timed out waiting for event ${event_name} in ${log_file}" >&2
+  return 1
+}
+
+has_event() {
+  local event_name="$1"
+  [[ -f "${ARTIFACT_DIR}/peercore.jsonl" ]] &&
+    grep -q "\"type\":\"${event_name}\"" "${ARTIFACT_DIR}/peercore.jsonl"
+}
+
+external_log_file() {
+  if [[ -f "${ARTIFACT_DIR}/go-peer.log" ]]; then
+    echo "${ARTIFACT_DIR}/go-peer.log"
+    return 0
+  fi
+  if [[ -f "${ARTIFACT_DIR}/rust-peer.log" ]]; then
+    echo "${ARTIFACT_DIR}/rust-peer.log"
+    return 0
+  fi
+  return 1
+}
+
+external_has_event() {
+  local event_name="$1"
+  local log_file=""
+  if ! log_file="$(external_log_file)"; then
+    return 1
+  fi
+  grep -q "\"type\":\"${event_name}\"" "${log_file}"
+}
+
+last_detail_for() {
+  local event_name="$1"
+  if [[ ! -f "${ARTIFACT_DIR}/peercore.jsonl" ]]; then
+    return 0
+  fi
+  sed -n "s/.*\"type\":\"${event_name}\".*\"detail\":\"\\([^\"]*\\)\".*/\\1/p" \
+    "${ARTIFACT_DIR}/peercore.jsonl" | tail -n1
+}
+
+write_summary() {
+  local case_name="$1"
+  local classification=""
+  local stage=""
+  local detail=""
+
+  if has_event connection_established; then
+    classification="PASS"
+    stage="connection_established"
+    detail="$(last_detail_for connection_established)"
+  elif ! external_has_event ready; then
+    classification="UNEXPECTED_FAIL"
+    stage="external_startup"
+    detail="external libp2p peer did not report ready"
+  elif has_event protocol_error; then
+    detail="$(last_detail_for protocol_error)"
+    stage="protocol_error"
+    if [[ "${detail}" == *noise* || "${detail}" == *handshake* || "${detail}" == *ciphertext* ]]; then
+      classification="EXPECTED_FAIL"
+    else
+      classification="UNEXPECTED_FAIL"
+    fi
+  elif has_event dial_failed; then
+    classification="UNEXPECTED_FAIL"
+    stage="dial_failed"
+    detail="$(last_detail_for dial_failed)"
+  elif has_event listen_error; then
+    classification="UNEXPECTED_FAIL"
+    stage="listen_error"
+    detail="$(last_detail_for listen_error)"
+  else
+    classification="UNEXPECTED_FAIL"
+    stage="unknown"
+    detail="no terminal diagnostic event recorded"
+  fi
+
+  cat >"${ARTIFACT_DIR}/summary.txt" <<EOF
+case: ${case_name}
+classification: ${classification}
+stage: ${stage}
+detail: ${detail}
+probe_started: $(has_event probe_started && echo yes || echo no)
+listener_started: $(has_event listener_started && echo yes || echo no)
+dial_requested: $(has_event dial_requested && echo yes || echo no)
+incoming_connection: $(has_event incoming_connection && echo yes || echo no)
+peer_identified: $(has_event peer_identified && echo yes || echo no)
+protocol_negotiated: $(has_event protocol_negotiated && echo yes || echo no)
+connection_established: $(has_event connection_established && echo yes || echo no)
+stream_opened: $(has_event stream_opened && echo yes || echo no)
+protocol_error: $(has_event protocol_error && echo yes || echo no)
+dial_failed: $(has_event dial_failed && echo yes || echo no)
+external_ready: $(external_has_event ready && echo yes || echo no)
+external_connected: $(external_has_event connected && echo yes || echo no)
+external_dial_failed: $(external_has_event dial_failed && echo yes || echo no)
+external_stream_opened: $(external_has_event stream_opened && echo yes || echo no)
+external_stream_echo_received: $(external_has_event stream_echo_received && echo yes || echo no)
+EOF
+}

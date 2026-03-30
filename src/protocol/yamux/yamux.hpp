@@ -25,16 +25,21 @@ constexpr uint8_t kYamuxVersion = 0;
 
 enum class YamuxType : uint8_t { Data = 0, WindowUpdate = 1, Ping = 2, GoAway = 3 };
 enum class YamuxFlag : uint16_t { SYN = 1, ACK = 2, FIN = 4, RST = 8 };
+enum class YamuxGoAwayCode : uint32_t { Normal = 0, ProtocolError = 1, InternalError = 2 };
+
+constexpr uint32_t kInitialStreamWindow = 256u * 1024u;
 
 // Single yamux-managed stream
 class YamuxStream : public MuxedStream {
 public:
-    using WriteCallback = std::function<Result<void>(StreamId, ConstBytes)>;
+    using WriteCallback = std::function<Result<size_t>(StreamId, ConstBytes)>;
     using CloseCallback = std::function<Result<void>(StreamId)>;
+    using WindowUpdateCallback = std::function<Result<void>(StreamId, size_t)>;
 
     YamuxStream(StreamId id,
                 ConnectionId conn_id,
                 WriteCallback write_cb,
+                WindowUpdateCallback window_update_cb,
                 CloseCallback close_write_cb,
                 CloseCallback reset_cb);
 
@@ -65,9 +70,10 @@ private:
     bool         read_closed_{false};
     bool         write_closed_{false};
     bool         reset_{false};
-    WriteCallback write_cb_;
-    CloseCallback close_write_cb_;
-    CloseCallback reset_cb_;
+    WriteCallback        write_cb_;
+    WindowUpdateCallback window_update_cb_;
+    CloseCallback        close_write_cb_;
+    CloseCallback        reset_cb_;
 
     std::deque<uint8_t>     recv_buf_;
     std::optional<ProtocolId> protocol_;
@@ -98,19 +104,28 @@ public:
 
 private:
     ConnectionId conn_id_;
+    bool         is_client_;
     uint32_t     next_stream_id_;
 
     std::unordered_map<StreamId, std::shared_ptr<YamuxStream>> streams_;
+    std::unordered_map<StreamId, uint32_t> send_windows_;
     std::vector<uint8_t>  recv_buf_;   // unparsed incoming bytes
     std::vector<uint8_t>  send_buf_;   // pending outgoing bytes
     AcceptCallback        accept_cb_;
     OutgoingCallback      outgoing_cb_;
     CloseCallback         close_cb_;
+    bool                  remote_go_away_{false};
 
     std::shared_ptr<YamuxStream> get_or_create_stream(StreamId sid, bool open_if_missing);
-    Result<void> write_stream_data(StreamId sid, ConstBytes data);
+    Result<size_t> write_stream_data(StreamId sid, ConstBytes data);
+    Result<void>   acknowledge_stream(StreamId sid);
     Result<void> close_stream_write(StreamId sid);
     Result<void> reset_stream(StreamId sid);
+    Result<void> update_receive_window(StreamId sid, size_t delta);
+    Result<void> send_ping_ack(uint32_t opaque_value);
+    Result<void> send_go_away(YamuxGoAwayCode code);
+    void         erase_stream(StreamId sid);
+    bool         is_remote_stream_id(StreamId sid) const;
 
     void        process_frames();
     bool        try_parse_frame(YamuxHeader& hdr, std::vector<uint8_t>& payload);

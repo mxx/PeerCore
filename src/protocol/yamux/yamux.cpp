@@ -45,11 +45,13 @@ bool has_flag(uint16_t flags, YamuxFlag flag) {
 YamuxStream::YamuxStream(StreamId id,
                          ConnectionId conn_id,
                          WriteCallback write_cb,
+                         WindowUpdateCallback window_update_cb,
                          CloseCallback close_write_cb,
                          CloseCallback reset_cb)
     : id_(id)
     , conn_id_(conn_id)
     , write_cb_(std::move(write_cb))
+    , window_update_cb_(std::move(window_update_cb))
     , close_write_cb_(std::move(close_write_cb))
     , reset_cb_(std::move(reset_cb)) {}
 
@@ -67,6 +69,9 @@ Result<size_t> YamuxStream::try_read(MutableBytes buf) {
         buf[i] = recv_buf_.front();
         recv_buf_.pop_front();
     }
+    if (window_update_cb_) {
+        (void)window_update_cb_(id_, n);
+    }
     return Result<size_t>::ok(n);
 }
 
@@ -74,9 +79,7 @@ Result<size_t> YamuxStream::try_write(ConstBytes data) {
     if (write_closed_ || reset_) {
         return Result<size_t>::err("stream is closed for writing");
     }
-    auto queued = write_cb_(id_, data);
-    if (queued.is_err()) return Result<size_t>::err(queued.error_message());
-    return Result<size_t>::ok(data.size());
+    return write_cb_(id_, data);
 }
 
 Result<void> YamuxStream::close_write() {
@@ -135,6 +138,7 @@ bool YamuxStream::write_closed() const {
 
 YamuxSession::YamuxSession(ConnectionId conn_id, bool is_client)
     : conn_id_(conn_id)
+    , is_client_(is_client)
     , next_stream_id_(is_client ? 1u : 2u) {}
 
 Result<void> YamuxSession::receive(ConstBytes data) {
@@ -148,6 +152,9 @@ std::vector<uint8_t> YamuxSession::drain_outgoing() {
 }
 
 Result<std::shared_ptr<YamuxStream>> YamuxSession::open_stream() {
+    if (remote_go_away_) {
+        return Result<std::shared_ptr<YamuxStream>>::err("yamux session is shutting down");
+    }
     const StreamId sid = next_stream_id_;
     next_stream_id_ += 2;
 
@@ -193,20 +200,50 @@ std::shared_ptr<YamuxStream> YamuxSession::get_or_create_stream(StreamId sid,
         [this](StreamId stream_id, ConstBytes payload) {
             return write_stream_data(stream_id, payload);
         },
+        [this](StreamId stream_id, size_t delta) {
+            return update_receive_window(stream_id, delta);
+        },
         [this](StreamId stream_id) { return close_stream_write(stream_id); },
         [this](StreamId stream_id) { return reset_stream(stream_id); });
     streams_[sid] = stream;
+    send_windows_[sid] = kInitialStreamWindow;
     return stream;
 }
 
-Result<void> YamuxSession::write_stream_data(StreamId sid, ConstBytes data) {
+Result<size_t> YamuxSession::write_stream_data(StreamId sid, ConstBytes data) {
+    auto it = send_windows_.find(sid);
+    if (it == send_windows_.end()) {
+        return Result<size_t>::err("unknown yamux stream");
+    }
+
+    const size_t writable = std::min<size_t>(data.size(), it->second);
+    if (writable == 0) {
+        return Result<size_t>::err("EAGAIN");
+    }
+
     write_frame(YamuxHeader{
         .version = kYamuxVersion,
         .type = static_cast<uint8_t>(YamuxType::Data),
         .flags = 0,
         .stream_id = sid,
-        .length = static_cast<uint32_t>(data.size()),
-    }, data);
+        .length = static_cast<uint32_t>(writable),
+    }, data.first(writable));
+    it->second -= static_cast<uint32_t>(writable);
+    if (outgoing_cb_) {
+        auto flushed = outgoing_cb_();
+        if (flushed.is_err()) return Result<size_t>::err(flushed.error_message());
+    }
+    return Result<size_t>::ok(writable);
+}
+
+Result<void> YamuxSession::acknowledge_stream(StreamId sid) {
+    write_frame(YamuxHeader{
+        .version = kYamuxVersion,
+        .type = static_cast<uint8_t>(YamuxType::Data),
+        .flags = flag_value(YamuxFlag::ACK),
+        .stream_id = sid,
+        .length = 0,
+    });
     if (outgoing_cb_) return outgoing_cb_();
     return Result<void>::ok();
 }
@@ -234,9 +271,58 @@ Result<void> YamuxSession::reset_stream(StreamId sid) {
         .stream_id = sid,
         .length = 0,
     });
-    streams_.erase(sid);
+    erase_stream(sid);
     if (outgoing_cb_) return outgoing_cb_();
     return Result<void>::ok();
+}
+
+Result<void> YamuxSession::update_receive_window(StreamId sid, size_t delta) {
+    if (delta == 0) return Result<void>::ok();
+
+    write_frame(YamuxHeader{
+        .version = kYamuxVersion,
+        .type = static_cast<uint8_t>(YamuxType::WindowUpdate),
+        .flags = 0,
+        .stream_id = sid,
+        .length = static_cast<uint32_t>(delta),
+    });
+    if (outgoing_cb_) return outgoing_cb_();
+    return Result<void>::ok();
+}
+
+Result<void> YamuxSession::send_ping_ack(uint32_t opaque_value) {
+    write_frame(YamuxHeader{
+        .version = kYamuxVersion,
+        .type = static_cast<uint8_t>(YamuxType::Ping),
+        .flags = flag_value(YamuxFlag::ACK),
+        .stream_id = 0,
+        .length = opaque_value,
+    });
+    if (outgoing_cb_) return outgoing_cb_();
+    return Result<void>::ok();
+}
+
+Result<void> YamuxSession::send_go_away(YamuxGoAwayCode code) {
+    write_frame(YamuxHeader{
+        .version = kYamuxVersion,
+        .type = static_cast<uint8_t>(YamuxType::GoAway),
+        .flags = 0,
+        .stream_id = 0,
+        .length = static_cast<uint32_t>(code),
+    });
+    if (outgoing_cb_) return outgoing_cb_();
+    return Result<void>::ok();
+}
+
+void YamuxSession::erase_stream(StreamId sid) {
+    streams_.erase(sid);
+    send_windows_.erase(sid);
+}
+
+bool YamuxSession::is_remote_stream_id(StreamId sid) const {
+    if (sid == 0) return false;
+    if (is_client_) return (sid % 2u) == 0u;
+    return (sid % 2u) == 1u;
 }
 
 void YamuxSession::process_frames() {
@@ -260,7 +346,9 @@ bool YamuxSession::try_parse_frame(YamuxHeader& hdr,
     hdr.stream_id = read_be32(header.subspan(4, 4));
     hdr.length = read_be32(header.subspan(8, 4));
 
-    const size_t frame_size = kHeaderSize + hdr.length;
+    const size_t payload_size =
+        hdr.type == static_cast<uint8_t>(YamuxType::Data) ? hdr.length : 0u;
+    const size_t frame_size = kHeaderSize + payload_size;
     if (recv_buf_.size() < frame_size) return false;
 
     payload.assign(recv_buf_.begin() + static_cast<std::ptrdiff_t>(kHeaderSize),
@@ -274,17 +362,47 @@ void YamuxSession::handle_frame(const YamuxHeader& hdr,
                                 std::vector<uint8_t> payload) {
     if (hdr.version != kYamuxVersion) return;
 
-    if (hdr.type != static_cast<uint8_t>(YamuxType::Data)) {
+    if (hdr.type == static_cast<uint8_t>(YamuxType::Ping)) {
+        if (!has_flag(hdr.flags, YamuxFlag::ACK)) {
+            (void)send_ping_ack(hdr.length);
+        }
+        return;
+    }
+
+    if (hdr.type == static_cast<uint8_t>(YamuxType::GoAway)) {
+        remote_go_away_ = true;
+        return;
+    }
+
+    const bool is_stream_frame = hdr.type == static_cast<uint8_t>(YamuxType::Data) ||
+                                 hdr.type == static_cast<uint8_t>(YamuxType::WindowUpdate);
+    if (!is_stream_frame || hdr.stream_id == 0) {
         return;
     }
 
     const bool open_if_missing = has_flag(hdr.flags, YamuxFlag::SYN);
+    if (open_if_missing && !is_remote_stream_id(hdr.stream_id)) {
+        (void)send_go_away(YamuxGoAwayCode::ProtocolError);
+        return;
+    }
+
     const bool existed = streams_.find(hdr.stream_id) != streams_.end();
     auto stream = get_or_create_stream(hdr.stream_id, open_if_missing);
     if (!stream) return;
 
     if (open_if_missing && !existed && accept_cb_) {
         accept_cb_(stream);
+    }
+    if (open_if_missing && !existed) {
+        (void)acknowledge_stream(hdr.stream_id);
+    }
+
+    if (hdr.type == static_cast<uint8_t>(YamuxType::WindowUpdate) && hdr.length > 0) {
+        auto it = send_windows_.find(hdr.stream_id);
+        if (it != send_windows_.end()) {
+            const uint64_t next = static_cast<uint64_t>(it->second) + hdr.length;
+            it->second = static_cast<uint32_t>(std::min<uint64_t>(next, UINT32_MAX));
+        }
     }
 
     if (!payload.empty()) {
@@ -301,7 +419,7 @@ void YamuxSession::handle_frame(const YamuxHeader& hdr,
         if (close_cb_) {
             close_cb_(hdr.stream_id, "yamux stream reset by peer");
         }
-        streams_.erase(hdr.stream_id);
+        erase_stream(hdr.stream_id);
     }
 }
 

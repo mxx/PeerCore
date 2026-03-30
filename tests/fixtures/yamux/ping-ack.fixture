@@ -1,0 +1,4 @@
+name: ping request receives ping ack
+role: server
+input_hex: 000200000000000012345678
+expected_output_hex: 000200020000000012345678

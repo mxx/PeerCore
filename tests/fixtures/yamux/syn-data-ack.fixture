@@ -1,0 +1,6 @@
+name: syn with inline payload is accepted and acknowledged
+role: server
+input_hex: 00000001000000010000000470696e67
+expected_output_hex: 000000020000000100000000
+expected_accept_stream_id: 1
+expected_read_hex: 70696e67
