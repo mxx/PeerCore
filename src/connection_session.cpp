@@ -354,6 +354,10 @@ public:
                 close();
                 return;
             }
+            if (errno == ECONNRESET) {
+                close();
+                return;
+            }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 break;
             }

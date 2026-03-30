@@ -3,6 +3,7 @@
 #include "probe_events.hpp"
 
 #include <peercore/protocol_handler.hpp>
+#include <peercore/services/identify_service.hpp>
 
 #include <sodium.h>
 
@@ -25,6 +26,7 @@ namespace peercore::interop::probe {
 namespace {
 
 constexpr std::string_view kEchoProtocol = "/test/echo/1.0.0";
+constexpr std::string_view kEchoPayload = "interop-ping";
 
 class EchoHandler final : public ProtocolHandler {
 public:
@@ -34,7 +36,11 @@ public:
         inbound_streams_.push_back(std::move(stream));
     }
 
-    void on_outbound_stream_ready(StreamHandle /*stream*/) override {}
+    void on_outbound_stream_ready(StreamHandle stream) override {
+        OutboundState state;
+        state.stream = std::move(stream);
+        outbound_streams_.push_back(std::move(state));
+    }
 
     void on_tick() override {
         std::vector<StreamHandle> still_open;
@@ -47,10 +53,61 @@ public:
             if (stream->is_open()) still_open.push_back(stream);
         }
         inbound_streams_ = std::move(still_open);
+
+        std::vector<OutboundState> active_outbound;
+        active_outbound.reserve(outbound_streams_.size());
+        for (auto& state : outbound_streams_) {
+            if (!state.payload_sent) {
+                auto wrote = state.stream->try_write(
+                    ConstBytes(reinterpret_cast<const uint8_t*>(kEchoPayload.data()),
+                               kEchoPayload.size()));
+                if (wrote.is_ok() && wrote.value() == kEchoPayload.size()) {
+                    state.payload_sent = true;
+                    print_json_event(ProbeEvent{
+                        .type = "stream_echo_sent",
+                        .phase = "stream",
+                        .detail = std::string(kEchoPayload),
+                        .connection_id = state.stream->connection_id(),
+                        .stream_id = state.stream->id(),
+                        .protocol = ProtocolId(kEchoProtocol),
+                    });
+                }
+            }
+
+            if (state.payload_sent && !state.echo_received) {
+                auto read = state.stream->try_read(buf);
+                if (read.is_ok() && read.value() > 0) {
+                    state.received.append(reinterpret_cast<const char*>(buf.data()), read.value());
+                    if (state.received.size() >= kEchoPayload.size()) {
+                        state.echo_received = true;
+                        print_json_event(ProbeEvent{
+                            .type = "stream_echo_received",
+                            .phase = "stream",
+                            .detail = state.received,
+                            .connection_id = state.stream->connection_id(),
+                            .stream_id = state.stream->id(),
+                            .protocol = ProtocolId(kEchoProtocol),
+                        });
+                        (void)state.stream->close_write();
+                    }
+                }
+            }
+
+            if (state.stream->is_open()) active_outbound.push_back(std::move(state));
+        }
+        outbound_streams_ = std::move(active_outbound);
     }
 
 private:
+    struct OutboundState {
+        StreamHandle stream;
+        bool         payload_sent{false};
+        bool         echo_received{false};
+        std::string  received;
+    };
+
     std::vector<StreamHandle> inbound_streams_;
+    std::vector<OutboundState> outbound_streams_;
 };
 
 bool decode_hex(std::string_view text, std::vector<uint8_t>& out) {
@@ -310,6 +367,7 @@ int run_probe(const ProbeConfig& config) {
     }
 
     Swarm swarm(peer_store, identity, config.muxers);
+    swarm.register_handler(std::make_shared<IdentifyService>());
     if (config.enable_echo_handler) {
         swarm.register_handler(std::make_shared<EchoHandler>());
     }

@@ -11,9 +11,6 @@ using namespace peercore;
 
 namespace {
 
-constexpr std::string_view kTestPeerId =
-    "12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb";
-
 std::vector<SwarmEvent> drain_events(Swarm& swarm) {
     std::vector<SwarmEvent> events;
     while (auto ev = swarm.next_event()) {
@@ -126,7 +123,7 @@ TEST(Swarm, ListenAndDialEstablishConnection) {
                                                          static_cast<uint16_t>(std::stoi(
                                                              server_events.front().detail.substr(
                                                                  server_events.front().detail.rfind('/') + 1))),
-                                                         kTestPeerId)).is_ok());
+                                                         server_identity.peer_id.to_string())).is_ok());
 
     bool server_incoming = false;
     bool server_established = false;
@@ -227,7 +224,7 @@ TEST(Swarm, PropagatesYamuxResetAsStreamClosedEvent) {
         "127.0.0.1",
         static_cast<uint16_t>(std::stoi(
             listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
-        kTestPeerId)).is_ok());
+        server_identity.peer_id.to_string())).is_ok());
 
     bool connected = false;
     std::optional<StreamHandle> client_stream;
@@ -303,7 +300,7 @@ TEST(Swarm, NegotiatesStreamProtocolAndDispatchesHandler) {
         "127.0.0.1",
         static_cast<uint16_t>(std::stoi(
             listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
-        kTestPeerId)).is_ok());
+        server_identity.peer_id.to_string())).is_ok());
 
     bool connected = false;
     bool stream_protocol_ready = false;
@@ -395,7 +392,7 @@ TEST(Swarm, ReportsUnsupportedStreamProtocolNegotiationFailure) {
         "127.0.0.1",
         static_cast<uint16_t>(std::stoi(
             listen_events.front().detail.substr(listen_events.front().detail.rfind('/') + 1))),
-        kTestPeerId)).is_ok());
+        server_identity.peer_id.to_string())).is_ok());
 
     bool connected = false;
     bool protocol_failed = false;

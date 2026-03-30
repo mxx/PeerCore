@@ -2,17 +2,21 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <cctype>
-#include <iomanip>
-#include <sstream>
+#include <optional>
+#include <vector>
 
 namespace peercore {
 
 namespace {
 
-constexpr std::string_view kPeerIdPrefix = "12D3KooW";
+constexpr uint8_t kIdentityMultihashCode = 0x00;
+constexpr uint8_t kIdentityPayloadLength = 36;
+constexpr std::array<uint8_t, 4> kEd25519PublicKeyPrefix{{0x08, 0x01, 0x12, 0x20}};
+constexpr std::string_view kBase58Alphabet =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 Result<Multiaddr::Ip4TcpEndpoint> parse_ip4_tcp_text(std::string_view text) {
     std::array<std::string, 7> parts{};
@@ -55,10 +59,76 @@ Result<Multiaddr::Ip4TcpEndpoint> parse_ip4_tcp_text(std::string_view text) {
     });
 }
 
-bool is_lower_hex(std::string_view text) {
-    return std::all_of(text.begin(), text.end(), [](unsigned char c) {
-        return std::isdigit(c) || (c >= 'a' && c <= 'f');
-    });
+std::optional<uint8_t> base58_value(char c) {
+    const auto pos = kBase58Alphabet.find(c);
+    if (pos == std::string_view::npos) return std::nullopt;
+    return static_cast<uint8_t>(pos);
+}
+
+std::string encode_base58(ConstBytes data) {
+    size_t leading_zeroes = 0;
+    while (leading_zeroes < data.size() && data[leading_zeroes] == 0) {
+        ++leading_zeroes;
+    }
+
+    std::vector<uint8_t> digits;
+    digits.reserve(data.size() * 2);
+
+    for (const auto byte : data) {
+        uint32_t carry = byte;
+        for (auto& digit : digits) {
+            carry += static_cast<uint32_t>(digit) << 8;
+            digit = static_cast<uint8_t>(carry % 58);
+            carry /= 58;
+        }
+        while (carry > 0) {
+            digits.push_back(static_cast<uint8_t>(carry % 58));
+            carry /= 58;
+        }
+    }
+
+    std::string out;
+    out.reserve(leading_zeroes + digits.size());
+    out.append(leading_zeroes, '1');
+    for (auto it = digits.rbegin(); it != digits.rend(); ++it) {
+        out.push_back(kBase58Alphabet[*it]);
+    }
+    if (out.empty()) out = "1";
+    return out;
+}
+
+Result<std::vector<uint8_t>> decode_base58(std::string_view text) {
+    size_t leading_zeroes = 0;
+    while (leading_zeroes < text.size() && text[leading_zeroes] == '1') {
+        ++leading_zeroes;
+    }
+
+    std::vector<uint8_t> bytes;
+    bytes.reserve(text.size());
+
+    for (const auto ch : text) {
+        const auto value = base58_value(ch);
+        if (!value.has_value()) {
+            return Result<std::vector<uint8_t>>::err("invalid base58 peer id");
+        }
+
+        uint32_t carry = *value;
+        for (auto& byte : bytes) {
+            carry += static_cast<uint32_t>(byte) * 58;
+            byte = static_cast<uint8_t>(carry & 0xFF);
+            carry >>= 8;
+        }
+        while (carry > 0) {
+            bytes.push_back(static_cast<uint8_t>(carry & 0xFF));
+            carry >>= 8;
+        }
+    }
+
+    std::vector<uint8_t> decoded;
+    decoded.reserve(leading_zeroes + bytes.size());
+    decoded.insert(decoded.end(), leading_zeroes, 0);
+    decoded.insert(decoded.end(), bytes.rbegin(), bytes.rend());
+    return Result<std::vector<uint8_t>>::ok(std::move(decoded));
 }
 
 }  // namespace
@@ -66,13 +136,12 @@ bool is_lower_hex(std::string_view text) {
 // ── PeerId ────────────────────────────────────────────────────────────────────
 
 std::string PeerId::to_string() const {
-    // Base58btc representation (stub: hex for now)
-    std::ostringstream oss;
-    oss << "12D3KooW";  // placeholder prefix
-    for (uint8_t b : bytes) {
-        oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b);
-    }
-    return oss.str();
+    std::array<uint8_t, 2 + kEd25519PublicKeyPrefix.size() + 32> payload{};
+    payload[0] = kIdentityMultihashCode;
+    payload[1] = kIdentityPayloadLength;
+    std::copy(kEd25519PublicKeyPrefix.begin(), kEd25519PublicKeyPrefix.end(), payload.begin() + 2);
+    std::copy(bytes.begin(), bytes.end(), payload.begin() + 2 + kEd25519PublicKeyPrefix.size());
+    return encode_base58(payload);
 }
 
 PeerId PeerId::from_bytes(std::span<const uint8_t, 32> b) {
@@ -82,20 +151,23 @@ PeerId PeerId::from_bytes(std::span<const uint8_t, 32> b) {
 }
 
 Result<PeerId> PeerId::from_string(std::string_view text) {
-    if (!text.starts_with(kPeerIdPrefix)) {
-        return Result<PeerId>::err("unsupported peer id format");
-    }
-
-    const auto hex = text.substr(kPeerIdPrefix.size());
-    if (hex.size() != 64 || !is_lower_hex(hex)) {
-        return Result<PeerId>::err("invalid peer id payload");
-    }
+    const auto decoded = decode_base58(text);
+    if (decoded.is_err()) return Result<PeerId>::err(decoded.error().message);
 
     PeerId p;
-    for (size_t i = 0; i < p.bytes.size(); ++i) {
-        const auto byte_text = hex.substr(i * 2, 2);
-        p.bytes[i] = static_cast<uint8_t>(std::strtoul(std::string(byte_text).c_str(), nullptr, 16));
+    const auto& bytes = decoded.value();
+    if (bytes.size() != 2 + kEd25519PublicKeyPrefix.size() + p.bytes.size()) {
+        return Result<PeerId>::err("invalid peer id payload");
     }
+    if (bytes[0] != kIdentityMultihashCode || bytes[1] != kIdentityPayloadLength) {
+        return Result<PeerId>::err("unsupported peer id multihash");
+    }
+    if (!std::equal(kEd25519PublicKeyPrefix.begin(),
+                    kEd25519PublicKeyPrefix.end(),
+                    bytes.begin() + 2)) {
+        return Result<PeerId>::err("unsupported peer id key type");
+    }
+    std::copy(bytes.begin() + 2 + kEd25519PublicKeyPrefix.size(), bytes.end(), p.bytes.begin());
     return Result<PeerId>::ok(p);
 }
 

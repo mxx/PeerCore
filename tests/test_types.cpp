@@ -3,6 +3,13 @@
 
 using namespace peercore;
 
+namespace {
+
+constexpr std::string_view kKnownPeerId =
+    "12D3KooWB2dWP3eEGxBLmLfxngYNtUVx9WDWjnuoUCv1SVjosRhG";
+
+}  // namespace
+
 TEST(PeerId, EqualityAndFromBytes) {
     std::array<uint8_t, 32> raw{};
     raw[0] = 0xAB;
@@ -17,9 +24,17 @@ TEST(PeerId, StringRoundTrip) {
     raw[31] = 0xEF;
     auto peer = PeerId::from_bytes(raw);
 
+    EXPECT_EQ(peer.to_string(), kKnownPeerId);
+
     auto parsed = PeerId::from_string(peer.to_string());
     ASSERT_TRUE(parsed.is_ok());
     EXPECT_EQ(parsed.value(), peer);
+}
+
+TEST(PeerId, RejectsPlaceholderEncoding) {
+    auto parsed = PeerId::from_string(
+        "12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb");
+    ASSERT_TRUE(parsed.is_err());
 }
 
 TEST(Result, OkAndErr) {
@@ -64,14 +79,13 @@ TEST(Multiaddr, FromIp4TcpBuildsAddress) {
 }
 
 TEST(Multiaddr, ParseIp4TcpWithPeerId) {
-    Multiaddr addr("/ip4/127.0.0.1/tcp/4001/p2p/12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb");
+    Multiaddr addr("/ip4/127.0.0.1/tcp/4001/p2p/" + std::string(kKnownPeerId));
     auto parsed = addr.parse_ip4_tcp();
     ASSERT_TRUE(parsed.is_ok());
     EXPECT_EQ(parsed.value().ip, "127.0.0.1");
     EXPECT_EQ(parsed.value().port, 4001);
     ASSERT_TRUE(parsed.value().peer_id.has_value());
-    EXPECT_EQ(*parsed.value().peer_id,
-              "12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb");
+    EXPECT_EQ(*parsed.value().peer_id, kKnownPeerId);
 }
 
 TEST(Multiaddr, ParseIp4TcpRejectsEmptyPeerId) {
@@ -82,8 +96,6 @@ TEST(Multiaddr, ParseIp4TcpRejectsEmptyPeerId) {
 }
 
 TEST(Multiaddr, FromIp4TcpWithPeerIdBuildsAddress) {
-    auto addr = Multiaddr::from_ip4_tcp(
-        "10.0.0.8", 30303, "12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb");
-    EXPECT_EQ(addr.to_string(),
-              "/ip4/10.0.0.8/tcp/30303/p2p/12D3KooW00112233445566778899aabbccddeeff00112233445566778899aabb");
+    auto addr = Multiaddr::from_ip4_tcp("10.0.0.8", 30303, kKnownPeerId);
+    EXPECT_EQ(addr.to_string(), "/ip4/10.0.0.8/tcp/30303/p2p/" + std::string(kKnownPeerId));
 }
