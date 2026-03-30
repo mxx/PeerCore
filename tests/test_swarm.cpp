@@ -309,6 +309,7 @@ TEST(Swarm, NegotiatesStreamProtocolAndDispatchesHandler) {
     bool stream_protocol_ready = false;
     bool server_stream_protocol_ready = false;
     std::optional<StreamHandle> client_stream;
+    bool hello_sent = false;
     std::string echoed;
 
     for (int i = 0; i < 160; ++i) {
@@ -340,15 +341,20 @@ TEST(Swarm, NegotiatesStreamProtocolAndDispatchesHandler) {
             client_stream = stream_res.value();
         }
 
-        if (stream_protocol_ready && client_stream.has_value() && echoed.empty()) {
+        if (stream_protocol_ready && client_stream.has_value() && !hello_sent) {
             static const std::array<uint8_t, 5> hello{{'h', 'e', 'l', 'l', 'o'}};
             auto write = (*client_stream)->try_write(hello);
             if (write.is_ok()) {
-                std::array<uint8_t, 16> read_buf{};
-                auto read = (*client_stream)->try_read(read_buf);
-                if (read.is_ok() && read.value() > 0) {
-                    echoed.assign(reinterpret_cast<const char*>(read_buf.data()), read.value());
-                }
+                hello_sent = true;
+            }
+        }
+
+        if (stream_protocol_ready && client_stream.has_value() &&
+            hello_sent && echoed.empty()) {
+            std::array<uint8_t, 16> read_buf{};
+            auto read = (*client_stream)->try_read(read_buf);
+            if (read.is_ok() && read.value() > 0) {
+                echoed.assign(reinterpret_cast<const char*>(read_buf.data()), read.value());
             }
         }
 

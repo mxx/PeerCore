@@ -205,7 +205,9 @@ public:
             }
 
             if (!negotiation.value().protocol.has_value()) {
-                (void)inner_->reset();
+                // Avoid an immediate reset race: let the remote side read `na`
+                // so both peers converge on a deterministic "protocol not supported" error.
+                (void)inner_->close_write();
                 return fail("protocol not supported");
             }
 

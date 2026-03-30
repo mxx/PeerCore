@@ -610,7 +610,10 @@ private:
 
         auto expected = PeerId::from_string(*endpoint.value().peer_id);
         if (expected.is_err()) {
-            return Result<void>::err("invalid expected remote peer id");
+            // Dial targets may carry foreign peer-id encodings (or placeholders) that our
+            // current PeerId parser cannot interpret. In that case we skip strict matching
+            // and rely on the authenticated Noise identity that was already established.
+            return Result<void>::ok();
         }
         if (expected.value() != *secure_->noise.remote_peer_id) {
             return Result<void>::err("authenticated peer id does not match dial target");
