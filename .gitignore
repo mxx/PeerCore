@@ -3,4 +3,5 @@ build-cov/
 .cache/
 compile_commands.json
 doc/remote-build.md
+tests/interop/bin/
 .*
