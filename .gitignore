@@ -4,4 +4,5 @@ build-cov/
 compile_commands.json
 doc/remote-build.md
 tests/interop/bin/
+tests/interop/rust-peer/target/
 .*

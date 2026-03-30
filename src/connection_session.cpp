@@ -32,6 +32,7 @@ enum class HandshakeState {
 enum class SecurityStage {
     NegotiatingProtocol,
     NoiseHandshake,
+    MuxerNegotiation,
     Ready,
 };
 
@@ -514,6 +515,11 @@ private:
             }
         }
 
+        if (!secure_->secure_ready && secure_->stage == SecurityStage::MuxerNegotiation) {
+            auto muxer = process_muxer_negotiation();
+            if (muxer.is_err()) return muxer;
+        }
+
         if (!secure_->secure_ready) return Result<void>::ok();
 
         while (true) {
@@ -672,7 +678,84 @@ private:
         secure_->negotiated_stream_muxer = select_stream_muxer(secure_->noise);
         if (secure_->negotiated_stream_muxer == std::optional<ProtocolId>("/yamux/1.0.0")) {
             activate_yamux();
+            return complete_ready_state();
         }
+
+        if (!secure_->noise.local_extensions.stream_muxers.empty()) {
+            secure_->stage = SecurityStage::MuxerNegotiation;
+            if (is_initiator_) {
+                auto proposal = MultistreamSelect::prepare_outbound(
+                    secure_->noise.local_extensions.stream_muxers);
+                if (proposal.is_err()) {
+                    return Result<void>::err(proposal.error().message);
+                }
+                return queue_encrypted_message(*io_, *secure_, proposal.value());
+            }
+            return Result<void>::ok();
+        }
+
+        return complete_ready_state();
+    }
+
+    Result<void> process_muxer_negotiation() {
+        while (true) {
+            std::vector<uint8_t> frame;
+            std::string error;
+            if (!try_pop_wire_frame(io_->wire_rx_buffer, frame, error)) {
+                if (!error.empty()) return Result<void>::err(error);
+                break;
+            }
+
+            auto plaintext = NoiseHandshake::decrypt(secure_->noise.cs_recv, frame);
+            if (plaintext.is_err()) return Result<void>::err(plaintext.error().message);
+            muxer_negotiation_buffer_.insert(muxer_negotiation_buffer_.end(),
+                                             plaintext.value().begin(),
+                                             plaintext.value().end());
+        }
+
+        auto incoming = ConstBytes(muxer_negotiation_buffer_.data(), muxer_negotiation_buffer_.size());
+        auto span = multistream_exchange_span(incoming);
+        if (span.is_err()) {
+            if (is_incomplete_multistream_error(span.error().message)) {
+                return Result<void>::ok();
+            }
+            return Result<void>::err(span.error().message);
+        }
+
+        ConstBytes exchange(muxer_negotiation_buffer_.data(), span.value());
+        if (is_initiator_) {
+            const auto& proposal = secure_->noise.local_extensions.stream_muxers.front();
+            auto selected = MultistreamSelect::read_outbound_response(exchange, proposal);
+            if (selected.is_ok()) {
+                secure_->negotiated_stream_muxer = selected.value();
+                if (secure_->negotiated_stream_muxer == std::optional<ProtocolId>("/yamux/1.0.0")) {
+                    activate_yamux();
+                }
+            } else if (selected.error().message != "protocol not supported") {
+                return Result<void>::err(selected.error().message);
+            }
+        } else {
+            auto negotiated = MultistreamSelect::negotiate_inbound(
+                exchange,
+                secure_->noise.local_extensions.stream_muxers);
+            if (negotiated.is_err()) return Result<void>::err(negotiated.error().message);
+            auto queued = queue_encrypted_message(*io_, *secure_, negotiated.value().outbound);
+            if (queued.is_err()) return queued;
+            if (negotiated.value().protocol.has_value()) {
+                secure_->negotiated_stream_muxer = negotiated.value().protocol;
+                if (secure_->negotiated_stream_muxer == std::optional<ProtocolId>("/yamux/1.0.0")) {
+                    activate_yamux();
+                }
+            }
+        }
+
+        muxer_negotiation_buffer_.erase(
+            muxer_negotiation_buffer_.begin(),
+            muxer_negotiation_buffer_.begin() + static_cast<std::ptrdiff_t>(span.value()));
+        return complete_ready_state();
+    }
+
+    Result<void> complete_ready_state() {
         secure_->stage = SecurityStage::Ready;
         secure_->secure_ready = true;
         state_ = ConnectionState::SecureReady;
@@ -781,6 +864,7 @@ private:
     std::vector<ConnectionEvent>     event_queue_;
     std::vector<StreamHandle>        pending_inbound_streams_;
     std::shared_ptr<YamuxSession>    yamux_session_;
+    std::vector<uint8_t>             muxer_negotiation_buffer_;
     StreamId                         next_stream_id_{1};
     bool                             closed_emitted_{false};
     bool                             is_initiator_{false};
