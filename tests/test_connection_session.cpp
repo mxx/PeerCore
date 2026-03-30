@@ -504,6 +504,59 @@ TEST(ConnectionSession, RejectsUnsupportedNoiseNegotiationResponse) {
     sockets.peer = -1;
 }
 
+TEST(ConnectionSession, PipelinesPostNoiseMuxerNegotiationAfterMsg3) {
+    ASSERT_GE(::sodium_init(), 0);
+    SocketPair sockets;
+    auto outbound_identity = make_identity();
+    auto inbound_identity = make_identity();
+    auto outbound = make_outbound_connection_session(
+        7,
+        sockets.local,
+        Multiaddr("/ip4/127.0.0.1/tcp/4001"),
+        outbound_identity,
+        {"/yamux/1.0.0"});
+    auto inbound = make_inbound_connection_session(
+        8,
+        sockets.peer,
+        Multiaddr("/ip4/127.0.0.1/tcp/4002"),
+        inbound_identity,
+        {"/mplex/6.7.0"});
+
+    ASSERT_TRUE(outbound->begin_outbound_upgrade().is_ok());
+    ASSERT_TRUE(inbound->begin_inbound_upgrade().is_ok());
+
+    for (int i = 0; i < 32; ++i) {
+        drive_sessions(*outbound, *inbound);
+        if (outbound->state() == ConnectionState::Ready &&
+            inbound->state() == ConnectionState::Ready) {
+            break;
+        }
+    }
+
+    EXPECT_EQ(outbound->state(), ConnectionState::Ready);
+    EXPECT_EQ(inbound->state(), ConnectionState::Ready);
+    EXPECT_FALSE(outbound->negotiated_stream_muxer().has_value());
+    EXPECT_FALSE(inbound->negotiated_stream_muxer().has_value());
+
+    auto outbound_events = drain_events(*outbound);
+    auto inbound_events = drain_events(*inbound);
+
+    ASSERT_GE(outbound_events.size(), 2u);
+    EXPECT_EQ(outbound_events[0].type, ConnectionEvent::Type::Secured);
+    EXPECT_EQ(outbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
+    EXPECT_EQ(outbound_events[1].detail,
+              "noise secure channel ready (single-stream fallback)");
+
+    ASSERT_GE(inbound_events.size(), 2u);
+    EXPECT_EQ(inbound_events[0].type, ConnectionEvent::Type::Secured);
+    EXPECT_EQ(inbound_events[1].type, ConnectionEvent::Type::MultiplexerReady);
+    EXPECT_EQ(inbound_events[1].detail,
+              "noise secure channel ready (single-stream fallback)");
+
+    sockets.local = -1;
+    sockets.peer = -1;
+}
+
 TEST(ConnectionSession, ClosesWhenPeerSendsTamperedNoiseMsg2) {
     ASSERT_GE(::sodium_init(), 0);
     SocketPair sockets;

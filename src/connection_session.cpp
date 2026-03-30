@@ -502,7 +502,8 @@ private:
         }
 
         if (!secure_->secure_ready && secure_->stage == SecurityStage::NoiseHandshake) {
-            while (!secure_->secure_ready) {
+            while (!secure_->secure_ready &&
+                   secure_->stage == SecurityStage::NoiseHandshake) {
                 std::vector<uint8_t> frame;
                 std::string error;
                 if (!try_pop_wire_frame(io_->wire_rx_buffer, frame, error)) {
